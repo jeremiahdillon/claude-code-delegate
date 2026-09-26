@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""delegate-agent — run a headless OpenCode agent on a bounded task.
+
+Runs a standalone `opencode run`, or, if an OpenCode server is configured
+(models.json "opencode.server" or $DELEGATE_OPENCODE_SERVER), attaches to it so
+sessions are visible in its web UI titled 'delegate: ...' (falling back to a
+standalone run if it is down). The
+agent's final message is captured from the event stream and written to --out
+by this wrapper; nothing large comes back on stdout:
+  DONE: <path>  model=... mode=plan session=ses_... cost=$... time=...s
+Exit codes: 0 ok, 2 usage, 3 refused, 4 no credits, 5 bad key, 6 upstream,
+7 timeout, 8 over --max-cost. See ~/.claude/skills/delegate.
+
+Modes (OpenCode's stock agents, run with --auto):
+  plan   investigate and report; file edits are blocked (bash is not)
+  build  may create/edit/move files; in a git repo the tree must start clean
+
+Examples:
+  delegate-agent --prompt "Find where retries are configured and explain them" --dir ~/Projects/app
+  delegate-agent --mode build --prompt "Rename every *.jpeg under assets/ to *.jpg" --dir .
+  delegate-agent --prompt-file BRIEF.md --out _review/iter-01/review.md --bare --model smart
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import delegate_common as dc  # noqa: E402
+
+SNAPSHOT_SKIP = {".git", "node_modules", ".delegate", ".venv", "__pycache__", ".opencode"}
+SNAPSHOT_CAP = 50_000
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="delegate-agent",
+        description="Headless OpenCode agent for discovery, review, or mechanical edits.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:" + __doc__.split("Examples:")[1])
+    p.add_argument("--prompt", help="task instructions")
+    p.add_argument("--prompt-file", help="read task instructions from a file")
+    p.add_argument("--mode", choices=["plan", "build"], default="plan",
+                   help="OpenCode agent: plan (default, no file edits) or build")
+    p.add_argument("--dir", default=".", help="directory the agent works in (default: cwd)")
+    p.add_argument("--files", nargs="*", default=[], help="files to attach as starting context")
+    p.add_argument("--model", help="alias (see --list-models) or model id")
+    p.add_argument("--out", help="output path (default: <repo>/.delegate/<stamp>-<slug>.md)")
+    p.add_argument("--bare", action="store_true",
+                   help="write only the agent's final text: no front matter, no house format")
+    p.add_argument("--max-cost", type=float, help="USD cap; the run is aborted when exceeded")
+    p.add_argument("--timeout", type=float, help="minutes before the run is aborted")
+    p.add_argument("--session", help="continue an existing OpenCode session id")
+    p.add_argument("--title", help="session title (default: 'delegate: <task slug>')")
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="build mode: allow starting with uncommitted changes")
+    p.add_argument("--allow-no-git", action="store_true",
+                   help="build mode: allow a directory that is not a git repo")
+    p.add_argument("--standalone", action="store_true",
+                   help="do not attach to the OpenCode server")
+    p.add_argument("--dry-run", action="store_true", help="show what would run; start nothing")
+    p.add_argument("--list-models", action="store_true", help="show model aliases and exit")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------- server
+
+def load_serve_env(path) -> dict:
+    """OPENCODE_SERVER_USERNAME/PASSWORD from the environment, overridden by an
+    optional KEY=VALUE file (models.json "opencode.server_env_file")."""
+    env = {k: v for k, v in os.environ.items() if k.startswith("OPENCODE_SERVER_")}
+    if not path:
+        return env
+    try:
+        for line in Path(path).expanduser().read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.replace("export ", "").strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return env
+
+
+def server_up(url: str) -> bool:
+    try:
+        urllib.request.urlopen(url, timeout=3)
+        return True
+    except urllib.error.HTTPError:
+        return True          # 401 = up, auth required
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def abort_session(url: str, env: dict, sid: str):
+    try:
+        user = env.get("OPENCODE_SERVER_USERNAME", "opencode")
+        tok = base64.b64encode(f"{user}:{env.get('OPENCODE_SERVER_PASSWORD', '')}".encode()).decode()
+        req = urllib.request.Request(f"{url}/session/{sid}/abort", data=b"{}", method="POST",
+                                     headers={"Authorization": f"Basic {tok}",
+                                              "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        dc.warn(f"could not abort session {sid} on the server ({e}); check the web UI")
+
+
+def check_opencode_model(cfg: dict, oc_provider: str, model_id: str):
+    try:
+        oc = json.loads(Path(cfg["opencode"]["config"]).expanduser().read_text())
+    except (OSError, ValueError):
+        return
+    prov = (oc.get("provider") or {}).get(oc_provider) or {}
+    wl = prov.get("whitelist")
+    if wl is not None and model_id not in wl:
+        raise dc.DelegateError(dc.EXIT_USAGE,
+            f"{oc_provider}/{model_id} is not in the OpenCode whitelist; add it to "
+            f"provider.{oc_provider}.whitelist and .models in {cfg['opencode']['config']} "
+            "and restart your OpenCode server if you run one")
+
+
+# ---------------------------------------------------------------- change tracking
+
+def snapshot(d: Path) -> set:
+    seen = set()
+    for root, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in SNAPSHOT_SKIP]
+        for f in files:
+            p = Path(root, f)
+            try:
+                st = p.stat()
+                seen.add((str(p.relative_to(d)), st.st_size, int(st.st_mtime)))
+            except OSError:
+                pass
+            if len(seen) >= SNAPSHOT_CAP:
+                return seen
+    return seen
+
+
+def git_changes(root: Path) -> list:
+    r = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+                       capture_output=True, text=True)
+    return [ln for ln in r.stdout.splitlines() if ln and not ln[3:].startswith(".delegate/")]
+
+
+def fs_changes(before: set, after: set) -> list:
+    b = {p: (s, m) for p, s, m in before}
+    a = {p: (s, m) for p, s, m in after}
+    out = [f"D  {p}" for p in sorted(b.keys() - a.keys())]
+    out += [f"A  {p}" for p in sorted(a.keys() - b.keys())]
+    out += [f"M  {p}" for p in sorted(a.keys() & b.keys()) if a[p] != b[p]]
+    return out
+
+
+# ---------------------------------------------------------------- prompt
+
+def compose(task: str, mode: str, work_dir: Path, bare: bool) -> str:
+    rules = [
+        "You are running headless and unattended as a worker delegated by an orchestrating "
+        "agent. Nobody will answer questions: make reasonable assumptions and state them.",
+        f"Work within {work_dir}. Do not read credential files (.env, keys, ~/.ssh, "
+        "API-key files, credential stores and the like).",
+        "Do not install packages. Do not run git commit, push, reset, checkout or other "
+        "commands that change git history or branches.",
+    ]
+    if mode == "plan":
+        rules.append("Do not create, modify or delete files; investigate and report.")
+    else:
+        rules.append("Make only the changes the task asks for. At the end, list every file "
+                     "you created, modified, moved or deleted.")
+    rules.append("Your final message is saved verbatim as the deliverable, so put the complete "
+                 "result in your final message, not a pointer to it. Do not write the "
+                 "deliverable to a file yourself.")
+    if not bare:
+        rules.append(dc.HOUSE_FORMAT)
+    return task.strip() + "\n\n---\nDelegation rules:\n" + "\n".join(f"- {r}" for r in rules)
+
+
+# ---------------------------------------------------------------- run
+
+def run(cmd: list, env: dict, cwd: Path, timeout_s: float, max_cost: float, on_session):
+    """Stream OpenCode JSON events. -> dict(result)"""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, cwd=str(cwd))
+    q: queue.Queue = queue.Queue()
+
+    def pump(stream, tag):
+        for line in stream:
+            q.put((tag, line))
+        q.put((tag, None))
+
+    threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True).start()
+
+    res = {"session": None, "cost": 0.0, "steps": 0, "tools": 0, "tok_in": 0, "tok_out": 0,
+           "texts": {}, "order": [], "errors": [], "stderr": [], "stopped": None}
+    deadline = time.time() + timeout_s
+    open_streams = 2
+    while open_streams:
+        try:
+            tag, line = q.get(timeout=1)
+        except queue.Empty:
+            tag, line = None, None
+        if tag and line is None:
+            open_streams -= 1
+            continue
+        if tag == "err":
+            res["stderr"].append(line)
+            res["stderr"] = res["stderr"][-50:]
+        elif tag == "out" and line.startswith("{"):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("sessionID") and not res["session"]:
+                res["session"] = ev["sessionID"]
+                on_session(res["session"])
+            t, part = ev.get("type"), ev.get("part") or {}
+            if t == "text":
+                mid, pid = part.get("messageID"), part.get("id")
+                if mid not in res["order"]:
+                    res["order"].append(mid)
+                res["texts"].setdefault(mid, {})[pid] = part.get("text") or ""
+            elif t == "tool_use":
+                res["tools"] += 1
+            elif t == "step_finish":
+                res["steps"] += 1
+                res["cost"] += part.get("cost") or 0
+                tk = part.get("tokens") or {}
+                res["tok_in"] += (tk.get("input") or 0) + ((tk.get("cache") or {}).get("read") or 0)
+                res["tok_out"] += (tk.get("output") or 0) + (tk.get("reasoning") or 0)
+            elif t == "error":
+                err = ev.get("error") or {}
+                res["errors"].append((err.get("data") or {}).get("message") or json.dumps(err)[:300])
+        if res["stopped"] is None:
+            if res["cost"] > max_cost:
+                res["stopped"] = ("budget", f"cost ${res['cost']:.4f} passed --max-cost {dc.fmt_cap(max_cost)}")
+            elif time.time() > deadline:
+                res["stopped"] = ("timeout", f"no result after {timeout_s / 60:.0f} min")
+            if res["stopped"]:
+                proc.terminate()
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
+    res["rc"] = proc.wait()
+    return res
+
+
+def final_text(res: dict) -> str:
+    for mid in reversed(res["order"]):
+        txt = "\n".join(t for t in res["texts"][mid].values() if t.strip())
+        if txt.strip():
+            return txt
+    return ""
+
+
+def main():
+    args = parse_args()
+    cfg = dc.load_config()
+    if args.list_models:
+        dc.list_models(cfg)
+        return
+    task = dc.read_prompt(args)
+    model = dc.resolve_model(cfg, args.model, "agent")
+    oc_model = f"{model['provider_cfg']['opencode_provider']}/{model['model']}"
+    max_cost = args.max_cost if args.max_cost is not None else cfg["limits"]["max_cost_usd"]
+    timeout_s = 60 * (args.timeout or cfg["limits"]["agent_timeout_min"])
+    work_dir = Path(args.dir).expanduser().resolve()
+    t0 = time.time()
+    res = None
+
+    try:
+        if not work_dir.is_dir():
+            raise dc.DelegateError(dc.EXIT_USAGE, f"--dir {work_dir} is not a directory")
+        if work_dir in (Path.home().resolve(), Path("/")):
+            raise dc.DelegateError(dc.EXIT_REFUSED, f"refusing to run in {work_dir}: OpenCode would "
+                                   "index the whole tree. Point --dir at a specific directory")
+        files = dc.check_files(args.files)
+        if "-" in files:
+            raise dc.DelegateError(dc.EXIT_USAGE, "stdin is not supported for --files here; use a file")
+        check_opencode_model(cfg, model["provider_cfg"]["opencode_provider"], model["model"])
+
+        # build-mode guard: start from a state we can diff
+        root = dc.git_root(work_dir)
+        before = None
+        if args.mode == "build":
+            if root:
+                dirty = git_changes(root)
+                if dirty and not args.allow_dirty:
+                    raise dc.DelegateError(dc.EXIT_REFUSED,
+                        f"{root} has {len(dirty)} uncommitted change(s); commit or stash first so "
+                        "the agent's edits can be reviewed as a diff (or pass --allow-dirty)")
+            elif not args.allow_no_git:
+                raise dc.DelegateError(dc.EXIT_REFUSED,
+                    f"{work_dir} is not in a git repo, so build-mode changes cannot be reviewed as "
+                    "a diff. Confirm with the user, then pass --allow-no-git")
+            if not root or args.allow_dirty:
+                before = snapshot(work_dir)
+
+        oc = cfg["opencode"]
+        server = os.environ.get("DELEGATE_OPENCODE_SERVER") or oc.get("server")
+        serve_env = load_serve_env(oc.get("server_env_file"))
+        attach = bool(server) and not args.standalone and server_up(server)
+        if server and not args.standalone and not attach:
+            dc.warn(f"OpenCode server at {server} is not responding; running standalone")
+        title = args.title or f"delegate: {dc.slugify(task, 50).replace('-', ' ')}"
+        message = compose(task, args.mode, work_dir, args.bare)
+
+        cmd = ["opencode", "run", "--format", "json", "--model", oc_model,
+               "--agent", args.mode, "--auto", "--title", title]
+        if attach:
+            cmd += ["--attach", server, "--dir", str(work_dir)]
+        if args.session:
+            cmd += ["--session", args.session]
+        if files:
+            cmd += ["--file", *files]
+        cmd += ["--", message]
+
+        plan = (f"model={oc_model} mode={args.mode} dir={work_dir} "
+                f"{'attach=' + server if attach else 'standalone'} files={len(files)} "
+                f"cap={dc.fmt_cap(max_cost)} timeout={timeout_s / 60:.0f}m")
+        if args.dry_run:
+            print(f"DRY RUN: {plan}\n  title: {title}\n  message: {len(message)} chars")
+            return
+
+        env = dict(os.environ)
+        if attach:
+            env.update({k: v for k, v in serve_env.items() if k.startswith("OPENCODE_SERVER_")})
+        session_holder = {}
+        res = run(cmd, env, work_dir, timeout_s, max_cost,
+                  lambda sid: session_holder.setdefault("id", sid))
+
+        if res["stopped"]:
+            kind, why = res["stopped"]
+            if attach and res["session"]:
+                abort_session(server, serve_env, res["session"])
+            raise dc.DelegateError(dc.EXIT_BUDGET if kind == "budget" else dc.EXIT_TIMEOUT,
+                                   f"aborted: {why} (session {res['session']})")
+        if res["errors"]:
+            msg = "; ".join(res["errors"])[:500]
+            code = dc.classify_error_text(msg)
+            if dc.is_zdr_miss(msg):
+                msg = f"{dc.ZDR_HINT}. {msg}"
+            elif "unexpected server error" in msg.lower():
+                msg += " (check the OpenCode server's logs)"
+            raise dc.DelegateError(code, f"OpenCode reported: {msg}")
+        text = final_text(res)
+        if not text.strip():
+            tail = "".join(res["stderr"][-5:]).strip()[:400]
+            raise dc.DelegateError(dc.EXIT_UPSTREAM if res["rc"] == 0 else dc.EXIT_FAIL,
+                                   f"agent produced no final message (exit {res['rc']}). {tail}")
+
+        changes = None
+        if args.mode == "build":
+            if before is not None:
+                changes = fs_changes(before, snapshot(work_dir))
+            else:
+                changes = git_changes(root)
+        secs = round(time.time() - t0, 1)
+        body = text
+        if changes is not None and not args.bare:
+            listing = "\n".join(changes[:200]) or "(no changes)"
+            more = f"\n... and {len(changes) - 200} more" if len(changes) > 200 else ""
+            body += (f"\n\n## Changes recorded by delegate-agent\n\n```\n{listing}{more}\n```\n")
+
+        out = dc.prepare_out(args.out, Path.cwd(), task)
+        dc.write_output(out, body, {
+            "delegate": "agent",
+            "mode": args.mode,
+            "model": oc_model,
+            "alias": model.get("alias"),
+            "zdr": bool(model["provider_cfg"].get("zdr")),
+            "dir": str(work_dir),
+            "session": res["session"],
+            "attached": attach,
+            "steps": res["steps"], "tool_calls": res["tools"],
+            "tokens_in": res["tok_in"], "tokens_out": res["tok_out"],
+            "cost_usd": round(res["cost"], 6),
+            "seconds": secs,
+            "changes": len(changes) if changes is not None else None,
+        }, args.bare)
+        dc.ledger({"tier": "agent", "mode": args.mode, "model": oc_model, "cwd": os.getcwd(),
+                   "dir": str(work_dir), "out": str(out), "session": res["session"],
+                   "steps": res["steps"], "tokens_in": res["tok_in"], "tokens_out": res["tok_out"],
+                   "cost_usd": res["cost"], "seconds": secs,
+                   "changes": len(changes) if changes is not None else None, "exit": 0})
+        print(f"DONE: {out}  model={oc_model} mode={args.mode} session={res['session']} "
+              f"steps={res['steps']} tools={res['tools']} cost=${res['cost']:.4f} time={secs}s")
+        if changes is not None:
+            print(f"CHANGES: {len(changes)}" + ("" if not changes else ":"))
+            for c in changes[:20]:
+                print(f"  {c}")
+            if len(changes) > 20:
+                print(f"  ... {len(changes) - 20} more (see output file)")
+    except dc.DelegateError as e:
+        if e.code != dc.EXIT_USAGE:
+            dc.ledger({"tier": "agent", "mode": args.mode, "model": oc_model, "cwd": os.getcwd(),
+                       "dir": str(work_dir), "exit": e.code, "error": e.msg[:300],
+                       "session": res["session"] if res else None,
+                       "cost_usd": res["cost"] if res else None,
+                       "seconds": round(time.time() - t0, 1)})
+        dc.die(e.code, e.msg)
+    except KeyboardInterrupt:
+        dc.die(130, "interrupted")
+
+
+if __name__ == "__main__":
+    main()

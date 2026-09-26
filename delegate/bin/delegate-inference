@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""delegate-inference — one-shot inference over known files, via a cheap model.
+
+Bundles --files with headers, sends one request (OpenRouter with zero-data-
+retention, or Google AI Studio), writes Markdown to --out, prints
+  DONE: <path>  model=... in=... out=... cost=$... time=...s
+Exit codes: 0 ok, 2 usage, 3 refused (deny list), 4 no credits, 5 bad key,
+6 upstream/rate limit, 8 over budget / too large. See ~/.claude/skills/delegate.
+
+Examples:
+  delegate-inference --files docs/*.md --prompt "Summarize the design decisions"
+  git diff main | delegate-inference --files - --prompt-file review.txt --model smart
+  delegate-inference --files big.txt --prompt "..." --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import delegate_common as dc  # noqa: E402
+
+CHARS_PER_TOKEN = 3.5          # conservative estimate for mixed prose/code
+EXPECTED_OUT_TOKENS = 4000     # output guess for cost estimates
+CHUNK_TOKENS = 120_000         # per-chunk input budget in --chunk mode
+
+SYSTEM = (
+    "You are a worker model handling a bounded task delegated by an orchestrating "
+    "agent. Work only from the material provided; do not invent content that is "
+    "not in it. " + dc.HOUSE_FORMAT
+)
+SYSTEM_BARE = (
+    "You are a worker model handling a bounded task delegated by an orchestrating "
+    "agent. Work only from the material provided; follow the requested output "
+    "format exactly."
+)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="delegate-inference",
+        description="One-shot delegated inference over known files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:" + __doc__.split("Examples:")[1])
+    p.add_argument("--prompt", help="task instructions")
+    p.add_argument("--prompt-file", help="read task instructions from a file")
+    p.add_argument("--files", nargs="*", default=[],
+                   help="input files ('-' reads stdin)")
+    p.add_argument("--model", help="alias (see --list-models) or model id")
+    p.add_argument("--out", help="output path (default: <repo>/.delegate/<stamp>-<slug>.md)")
+    p.add_argument("--bare", action="store_true",
+                   help="write only the model's text: no front matter, no house format")
+    p.add_argument("--max-cost", type=float, help="USD cap; refuse if the estimate exceeds it")
+    p.add_argument("--max-tokens", type=int, help="output token cap")
+    p.add_argument("--reasoning", choices=["off", "low", "medium", "high"],
+                   help="reasoning effort (default: model default)")
+    p.add_argument("--json", action="store_true", help="ask for a JSON object response")
+    p.add_argument("--chunk", action="store_true",
+                   help="if input exceeds the model context: map over chunks, then merge")
+    p.add_argument("--dry-run", action="store_true", help="show plan and estimate; send nothing")
+    p.add_argument("--list-models", action="store_true", help="show model aliases and exit")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------- input
+
+def load_inputs(files: list) -> list:
+    """-> [(label, text)]"""
+    out = []
+    for f in files:
+        if f == "-":
+            out.append(("<stdin>", sys.stdin.read()))
+            continue
+        raw = Path(f).read_bytes()
+        if b"\x00" in raw[:8192]:
+            raise dc.DelegateError(dc.EXIT_USAGE, f"{f} looks binary; convert it to text first")
+        out.append((f, raw.decode("utf-8", errors="replace")))
+    return out
+
+
+def render(inputs: list) -> str:
+    parts = []
+    for label, text in inputs:
+        n = text.count("\n") + 1
+        parts.append(f"===== FILE: {label} ({n} lines) =====\n{text.rstrip()}\n===== END FILE: {label} =====")
+    return "\n\n".join(parts)
+
+
+def est_tokens(s: str) -> int:
+    return int(len(s) / CHARS_PER_TOKEN) + 1
+
+
+def chunk_inputs(inputs: list, budget: int) -> list:
+    """Split into groups of rendered text each under ~budget tokens.
+    Files are kept whole where possible; oversized files are split by lines."""
+    pieces = []
+    for label, text in inputs:
+        if est_tokens(text) <= budget:
+            pieces.append((label, text))
+            continue
+        lines, buf, part = text.splitlines(keepends=True), [], 1
+        for ln in lines:
+            buf.append(ln)
+            if est_tokens("".join(buf)) >= budget:
+                pieces.append((f"{label} [part {part}]", "".join(buf)))
+                buf, part = [], part + 1
+        if buf:
+            pieces.append((f"{label} [part {part}]", "".join(buf)))
+    chunks, cur = [], []
+    for pc in pieces:
+        if cur and est_tokens(render(cur + [pc])) > budget:
+            chunks.append(cur)
+            cur = []
+        cur.append(pc)
+    if cur:
+        chunks.append(cur)
+    return [render(c) for c in chunks]
+
+
+# ---------------------------------------------------------------- calling
+
+def call(model: dict, key: str, system: str, user: str, args, max_tokens: int) -> dict:
+    """One chat completion with retries. -> {text, in, out, cost, finish}"""
+    pc = model["provider_cfg"]
+    body = {
+        "model": model["model"],
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    if args.json:
+        body["response_format"] = {"type": "json_object"}
+    if model["provider"] == "openrouter":
+        body["usage"] = {"include": True}
+        if pc.get("zdr"):
+            body["provider"] = {"zdr": True, "data_collection": "deny"}
+        if args.reasoning:
+            body["reasoning"] = ({"enabled": False} if args.reasoning == "off"
+                                 else {"effort": args.reasoning})
+    elif args.reasoning:
+        body["reasoning_effort"] = "none" if args.reasoning == "off" else args.reasoning
+    headers = {"X-Title": "delegate-inference"} if model["provider"] == "openrouter" else {}
+
+    last = ""
+    for attempt in range(4):
+        try:
+            r = dc.http_json(pc["base_url"] + "/chat/completions", key, body,
+                             timeout=900, extra_headers=headers)
+            if "error" in r:  # OpenRouter can return 200 with an error body
+                raise dc.DelegateError(dc.classify_error_text(json.dumps(r["error"])),
+                                       f"provider error: {json.dumps(r['error'])[:300]}")
+            ch = r["choices"][0]
+            text = ch["message"].get("content") or ""
+            u = r.get("usage") or {}
+            cost = u.get("cost")
+            if cost is None and model.get("price"):
+                cost = (u.get("prompt_tokens", 0) * model["price"]["input"]
+                        + u.get("completion_tokens", 0) * model["price"]["output"]) / 1e6
+            return {"text": text, "in": u.get("prompt_tokens"), "out": u.get("completion_tokens"),
+                    "cost": cost, "finish": ch.get("finish_reason")}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code == 402:
+                raise dc.DelegateError(dc.EXIT_CREDITS, f"{model['provider']} 402 (out of credits / key limit): {detail}")
+            if e.code in (401, 403) or (e.code == 400 and "api key" in detail.lower()):
+                raise dc.DelegateError(dc.EXIT_AUTH, f"{model['provider']} {e.code} (bad key?): {detail}")
+            if e.code in (400, 404) and dc.is_zdr_miss(detail):
+                raise dc.DelegateError(dc.EXIT_UPSTREAM, f"{dc.ZDR_HINT}. {detail}")
+            if e.code in (400, 404, 413, 422):
+                raise dc.DelegateError(dc.EXIT_UPSTREAM, f"{model['provider']} {e.code}: {detail}")
+            last = f"HTTP {e.code}: {detail}"
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+            last = f"network: {e}"
+        except (KeyError, IndexError, ValueError) as e:
+            last = f"malformed response: {e}"
+        wait = 2 ** (attempt + 1)
+        dc.warn(f"attempt {attempt + 1} failed ({last[:160]}); retrying in {wait}s")
+        time.sleep(wait)
+    code = dc.EXIT_CREDITS if "429" in last and "quota" in last.lower() and \
+        model["provider"] == "google" else dc.EXIT_UPSTREAM
+    raise dc.DelegateError(code, f"gave up after 4 attempts: {last[:400]}")
+
+
+def preflight_credits(model: dict, key: str, est_cost: float):
+    if model["provider"] != "openrouter":
+        return None
+    try:
+        d = dc.http_json(model["provider_cfg"]["base_url"] + "/key", key, timeout=20)["data"]
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise dc.DelegateError(dc.EXIT_AUTH, f"OpenRouter rejected the key ({e.code})")
+        dc.warn(f"credit check failed (HTTP {e.code}); continuing")
+        return None
+    except Exception as e:  # noqa: BLE001
+        dc.warn(f"credit check failed ({e}); continuing")
+        return None
+    rem = d.get("limit_remaining")
+    if rem is not None and rem < max(est_cost, 0.001):
+        raise dc.DelegateError(dc.EXIT_CREDITS,
+                               f"OpenRouter key has ${rem:.4f} left (estimate ${est_cost:.4f}). "
+                               "Top up or raise the key limit at openrouter.ai/settings/keys")
+    return rem
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    args = parse_args()
+    cfg = dc.load_config()
+    if args.list_models:
+        dc.list_models(cfg)
+        return
+    prompt = dc.read_prompt(args)
+    model = dc.resolve_model(cfg, args.model, "inference")
+    max_cost = args.max_cost if args.max_cost is not None else cfg["limits"]["max_cost_usd"]
+    max_tokens = args.max_tokens or cfg["limits"]["max_output_tokens"]
+    t0 = time.time()
+
+    try:
+        files = dc.check_files(args.files)
+        inputs = load_inputs(files)
+        key = os.environ.get(model["provider_cfg"]["key_env"])
+        if not key:
+            raise dc.DelegateError(dc.EXIT_AUTH, f"{model['provider_cfg']['key_env']} is not set "
+                                   "(export it in the environment Claude Code runs in)")
+
+        # context + price
+        if model["provider"] == "openrouter":
+            meta = dc.openrouter_models(key).get(model["model"], {})
+            context = model.get("context") or meta.get("context") or 128_000
+            price = model.get("price") or ({"input": meta["input"], "output": meta["output"]} if meta else None)
+        else:
+            context = model.get("context") or 1_000_000
+            price = model.get("price")
+        model["price"] = price
+
+        material = render(inputs)
+        system = SYSTEM_BARE if args.bare else SYSTEM
+        user = f"TASK:\n{prompt.strip()}\n\nMATERIAL:\n{material}" if inputs else prompt
+        in_tok = est_tokens(system + user)
+        limit = int(context * 0.9) - max_tokens
+
+        chunks = None
+        if in_tok > limit:
+            if not args.chunk:
+                raise dc.DelegateError(dc.EXIT_BUDGET,
+                    f"input is ~{in_tok:,} tokens; {dc.model_label(model)} fits ~{limit:,} "
+                    f"(context {context:,}). Use --chunk to map/merge, trim the inputs, "
+                    "or pick a larger-context model")
+            chunks = chunk_inputs(inputs, min(CHUNK_TOKENS, limit // 2))
+
+        n_calls = (len(chunks) + 1) if chunks else 1
+        est_in = in_tok + (n_calls - 1) * EXPECTED_OUT_TOKENS if chunks else in_tok
+        est_out = EXPECTED_OUT_TOKENS * n_calls
+        est_cost = ((est_in * price["input"] + est_out * price["output"]) / 1e6) if price else None
+
+        plan = (f"model={dc.model_label(model)} provider={model['provider']}"
+                f"{' zdr' if model['provider_cfg'].get('zdr') else ''} files={len(inputs)} "
+                f"in~{in_tok:,}tok calls={n_calls} est={dc.fmt_cost(est_cost)} cap={dc.fmt_cap(max_cost)}")
+        over = est_cost is not None and est_cost > max_cost
+        if args.dry_run:
+            print(f"DRY RUN: {plan}" + ("  (OVER CAP: raise --max-cost)" if over else ""))
+            for label, text in inputs:
+                print(f"  {label}: ~{est_tokens(text):,} tok")
+            return
+        if over:
+            raise dc.DelegateError(dc.EXIT_BUDGET, f"estimate {dc.fmt_cost(est_cost)} exceeds "
+                                   f"--max-cost {dc.fmt_cap(max_cost)} ({plan})")
+
+        remaining = preflight_credits(model, key, est_cost or 0)
+
+        if not chunks:
+            r = call(model, key, system, user, args, max_tokens)
+            text, tin, tout, cost, finish = r["text"], r["in"], r["out"], r["cost"], r["finish"]
+        else:
+            map_task = (f"TASK (applies to the whole corpus; you see chunk {{i}} of {len(chunks)}):\n"
+                        f"{prompt.strip()}\n\nFor THIS chunk only, extract every fact, finding and "
+                        "quote relevant to the task, with file references. Be complete; your notes "
+                        "will be merged with notes from the other chunks.\n\nMATERIAL:\n")
+            def one(i_c):
+                i, c = i_c
+                return call(model, key, SYSTEM_BARE, map_task.replace("{i}", str(i + 1)) + c,
+                            args, max_tokens)
+            with cf.ThreadPoolExecutor(max_workers=4) as ex:
+                parts = list(ex.map(one, enumerate(chunks)))
+            notes = "\n\n".join(f"===== NOTES FROM CHUNK {i + 1} =====\n{p['text']}"
+                                for i, p in enumerate(parts))
+            reduce_user = (f"TASK:\n{prompt.strip()}\n\nThe material was too large to read at once, "
+                           "so it was split into chunks and each was summarized into notes. "
+                           "Complete the task from these notes.\n\n" + notes)
+            r = call(model, key, system, reduce_user, args, max_tokens)
+            allp = parts + [r]
+            text, finish = r["text"], r["finish"]
+            tin = sum(p["in"] or 0 for p in allp)
+            tout = sum(p["out"] or 0 for p in allp)
+            cost = sum(p["cost"] or 0 for p in allp) if all(p["cost"] is not None for p in allp) else None
+
+        if not text.strip():
+            raise dc.DelegateError(dc.EXIT_UPSTREAM, f"empty response (finish={finish})")
+        secs = round(time.time() - t0, 1)
+        out = dc.prepare_out(args.out, Path.cwd(), prompt)
+        dc.write_output(out, text, {
+            "delegate": "inference",
+            "model": model["model"],
+            "alias": model.get("alias"),
+            "provider": model["provider"],
+            "zdr": bool(model["provider_cfg"].get("zdr")),
+            "inputs": [l for l, _ in inputs],
+            "chunks": len(chunks) if chunks else None,
+            "tokens_in": tin, "tokens_out": tout,
+            "cost_usd": round(cost, 6) if cost is not None else None,
+            "seconds": secs,
+            "finish": finish,
+            "truncated": finish == "length" or None,
+        }, args.bare)
+        dc.ledger({"tier": "inference", "model": model["model"], "provider": model["provider"],
+                   "cwd": os.getcwd(), "out": str(out), "files": len(inputs), "chunks": len(chunks) if chunks else 0,
+                   "tokens_in": tin, "tokens_out": tout, "cost_usd": cost, "seconds": secs, "exit": 0})
+        line = (f"DONE: {out}  model={model['model']} in={tin} out={tout} "
+                f"cost={dc.fmt_cost(cost)} time={secs}s")
+        if remaining is not None and cost is not None:
+            line += f" key_left=${remaining - cost:.2f}"
+        print(line)
+        if finish == "length":
+            print("WARNING: output hit --max-tokens and is truncated")
+    except dc.DelegateError as e:
+        if e.code != dc.EXIT_USAGE:
+                dc.ledger({"tier": "inference", "model": model["model"], "provider": model["provider"],
+                       "cwd": os.getcwd(), "exit": e.code, "error": e.msg[:300],
+                       "seconds": round(time.time() - t0, 1)})
+        dc.die(e.code, e.msg)
+    except KeyboardInterrupt:
+        dc.die(130, "interrupted")
+
+
+if __name__ == "__main__":
+    main()

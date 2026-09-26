@@ -1,0 +1,44 @@
+# Files matching these patterns are never sent to a delegated model
+# (delegate-inference --files and delegate-agent --files).
+#
+# - A pattern without '/' matches the file name:        *.pem
+# - A pattern with a leading '/' or '~' matches the full path:  ~/.ssh/*
+# - A relative pattern with '/' matches that dir anywhere:      secrets/*
+# - '*' also spans '/', so dir/* covers everything below dir.
+# - A leading '!' re-allows a file an earlier pattern denied.
+#
+# Add to this over time. Note: this does NOT restrict what an OpenCode agent
+# chooses to open on its own (delegate-agent runs stock plan/build permissions).
+
+# env files and keys
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+*.key
+*.pem
+*.token
+*.p12
+*.pfx
+*.keystore
+secrets/*
+credentials/*
+
+# standard credential stores (add your own, e.g. wherever you keep API keys)
+~/.claude/.credentials.json
+~/.local/share/opencode/auth.json
+~/.ssh/*
+~/.aws/*
+~/.gnupg/*
+~/.config/gh/hosts.yml
+~/.docker/config.json
+~/.kube/config
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.netrc
+.npmrc
+.pypirc
+*.keychain
+*.keychain-db

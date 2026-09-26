@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""review-loop — automated builder/reviewer adversarial review cycles.
+
+Claude Code is the builder. The reviewer is a cheaper model from another lab,
+run one round at a time through delegate-agent (fresh session per round, plan
+mode, output captured to iter-NN/review.md). Every hand-over is a git commit.
+
+  review-loop new <cycle>                      scaffold the review dir (first time) and the cycle's BRIEF.md
+  review-loop init <cycle> [--reviewer M] [--max N] [--budget USD] [--trailer T]
+                                               open the cycle (BRIEF.md filled in, tree clean)
+  review-loop review [--model M]               run one reviewer round; validate; commit
+  review-loop respond --decision continue|close [--override REASON] [--trailer T]
+                                               validate response.md (and CLOSE.md); commit the fixes
+  review-loop status | ledger | changes [--iteration N] | list
+  review-loop adjust [--budget USD] [--max N] [--model M]   change an open cycle's limits (with user approval)
+
+Global: --repo PATH (default: the git repo containing cwd), --review-dir DIR, --cycle C.
+Exit codes follow delegate-*: 0 ok, 1 failure, 2 usage/state, 3 refused,
+4 credits, 5 auth, 6 upstream, 7 timeout, 8 budget/cap, 9 review format invalid.
+Docs: ~/.claude/skills/adversarial-review/SKILL.md
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+HOME_DIR = Path(__file__).resolve().parent.parent          # the review-loop/ directory
+TEMPLATES = HOME_DIR / "templates"
+DEFAULTS = HOME_DIR / "defaults.json"
+DIR_CANDIDATES = ("_review", ".review", ".delegate/review")
+
+SEVERITIES = ("blocker", "major", "minor", "nit")
+VERDICTS = ("ACCEPT", "REJECT", "PARTIAL", "BACKLOG")
+V_STATUSES = ("verified", "not-fixed", "regressed", "partially-fixed")
+OUTCOMES = ("converged", "cap-reached", "budget-reached", "aborted")
+
+F_HDR = re.compile(r"^### (F-(\d{2})-\d{2}) · (blocker|major|minor|nit) · ([a-z][a-z-]*)\s*$", re.M)
+C_HDR = re.compile(r"^### (C-(\d{2})-\d{2}) · re (F-\d{2}-\d{2})\s*$", re.M)
+V_HDR = re.compile(r"^### (V-(\d{2})-\d{2}) · (F-\d{2}-\d{2}) · (verified|not-fixed|regressed|partially-fixed)\s*$", re.M)
+R_HDR = re.compile(r"^### ([FC]-\d{2}-\d{2}) · (ACCEPT|REJECT|PARTIAL|BACKLOG)\s*$", re.M)
+REC = re.compile(r"^## Recommendation: (continue|converge)\s*$", re.M)
+OUTCOME = re.compile(r"^Outcome: (converged|cap-reached|budget-reached|aborted)\s*$", re.M)
+REQUIRED_BRIEF = ("what you are reviewing", "in scope", "out of scope", "intent",
+                  "settled", "forward", "checks", "checklist")
+
+EXIT_MEANING = {1: "unexpected failure", 2: "usage", 3: "refused", 4: "out of credits / key limit",
+                5: "bad or missing API key", 6: "provider error or rate limit",
+                7: "reviewer timed out", 8: "over budget", 130: "interrupted"}
+
+
+def now() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def die(msg: str, code: int = 2):
+    print(f"ERROR: {msg}")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- context
+
+class Ctx:
+    def __init__(self, a):
+        start = Path(a.repo).expanduser().resolve() if a.repo else Path.cwd()
+        r = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"{start} is not in a git repository. review-loop commits every hand-over; "
+                "ask the user whether to `git init` it", 3)
+        self.root = Path(r.stdout.strip())
+        self.defaults = json.loads(DEFAULTS.read_text())
+        self.rdir = self._find_dir(a.review_dir)
+        cfg_path = self.rdir / "config.json"
+        self.cfg = dict(self.defaults)
+        if cfg_path.exists():
+            self.cfg.update(json.loads(cfg_path.read_text()))
+        self.cycles = self.rdir / "cycles"
+        self.current = self.rdir / "CURRENT"
+        self.trailer = getattr(a, "trailer", None)
+
+    def _find_dir(self, explicit):
+        if explicit:
+            return (self.root / explicit).resolve()
+        for cand in (self.defaults["review_dir"],) + DIR_CANDIDATES:
+            if (self.root / cand / "config.json").exists():
+                return self.root / cand
+        return self.root / self.defaults["review_dir"]
+
+    def rel(self, p: Path) -> str:
+        return str(p.resolve().relative_to(self.root))
+
+    # git
+    def git(self, *args, check=True):
+        r = subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True)
+        if check and r.returncode != 0:
+            die(f"git {' '.join(args)} failed: {r.stderr.strip()}", 1)
+        return r.stdout
+
+    def dirty_outside(self, prefix: str) -> list:
+        out = self.git("status", "--porcelain", "--untracked-files=all")
+        bad = []
+        for line in out.splitlines():
+            p = line[3:].split(" -> ")[-1].strip('"')
+            if p.startswith(prefix) or p.startswith((".opencode/", ".delegate/")):
+                continue
+            bad.append(p)
+        return bad
+
+    def commit(self, add: list, message: str):
+        self.git("add", "-A", *add)
+        msg = message + (f"\n\n{self.trailer}" if self.trailer else "")
+        r = subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=self.root,
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return (r.stderr or r.stdout).strip()
+        return None
+
+    def head(self) -> str:
+        return self.git("rev-parse", "HEAD").strip()
+
+    # cycles
+    def cycle_name(self, name):
+        name = name or (self.current.read_text().strip() if self.current.exists() else "")
+        if not name:
+            die("no cycle given and none is current (review-loop list)")
+        return name
+
+    def cdir(self, c): return self.cycles / c
+    def idir(self, c, n): return self.cdir(c) / f"iter-{n:02d}"
+
+    def load(self, c):
+        sp = self.cdir(c) / "STATE.json"
+        if not sp.exists():
+            die(f"cycle {c!r} is not open (write its BRIEF.md, then review-loop init {c})")
+        return json.loads(sp.read_text())
+
+    def save(self, c, s):
+        s["updated_at"] = now()
+        sp = self.cdir(c) / "STATE.json"
+        tmp = sp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(s, indent=2) + "\n")
+        os.replace(tmp, sp)
+
+
+def usd(x: float) -> str:
+    return f"${x:.2f}" if x >= 0.1 or x == 0 else f"${x:.3f}"
+
+
+def has_todo(text: str) -> bool:
+    return bool(re.search(r"\bTODO\b", re.sub(r"<!--.*?-->", "", text, flags=re.S)))
+
+
+# ---------------------------------------------------------------- parsing + ledger
+
+def finding_title(text: str, fid: str) -> str:
+    m = re.search(rf"^### {re.escape(fid)} .*?$(.*?)(?=^### |^## |\Z)", text, re.M | re.S)
+    if not m:
+        return ""
+    fm = re.search(r"\*\*Finding:\*\*\s*(.+)", m.group(1))
+    t = (fm.group(1) if fm else m.group(1).strip().split("\n")[0]).strip()
+    return (t[:110] + "…") if len(t) > 110 else t
+
+
+def read(p: Path) -> str:
+    return p.read_text() if p.exists() else ""
+
+
+def ledger(ctx: Ctx, c: str, upto: int) -> dict:
+    """Replay reviews and responses 1..upto into per-finding status.
+
+    Status: open (new, no verdict yet) · fix-pending (ACCEPT/PARTIAL, awaiting
+    verification) · verified · reopened (V said not fixed) · challenged ·
+    rejected · backlog · disputed (rejected again after a challenge).
+    """
+    fs = {}
+    for n in range(1, upto + 1):
+        rv = read(ctx.idir(c, n) / "review.md")
+        for fid, _it, sev, cat in F_HDR.findall(rv):
+            fs[fid] = {"id": fid, "sev": sev, "cat": cat, "iter": n, "status": "open",
+                       "title": finding_title(rv, fid), "last_verdict": None}
+        for _vid, _it, ref, st in V_HDR.findall(rv):
+            if ref in fs:
+                fs[ref]["status"] = "verified" if st == "verified" else "reopened"
+                fs[ref]["v"] = st
+        challenged = {}
+        for cid, _it, ref in C_HDR.findall(rv):
+            if ref in fs:
+                fs[ref]["status"] = "challenged"
+                challenged[cid] = ref
+        rs = read(ctx.idir(c, n) / "response.md")
+        for rid, verdict in R_HDR.findall(rs):
+            ref = challenged.get(rid, rid)
+            if ref not in fs:
+                continue
+            f = fs[ref]
+            f["last_verdict"] = verdict
+            if verdict in ("ACCEPT", "PARTIAL"):
+                f["status"] = "fix-pending"
+            elif verdict == "BACKLOG":
+                f["status"] = "backlog"
+            elif verdict == "REJECT":
+                f["status"] = "disputed" if rid.startswith("C-") else "rejected"
+    return fs
+
+
+def validate_review(text: str, n: int, must_verify: set, categories: list):
+    problems = []
+    rec = REC.search(text)
+    if not rec:
+        problems.append("missing the final line '## Recommendation: continue' or '## Recommendation: converge'")
+    if not re.search(r"^# Review\b", text, re.M):
+        problems.append("missing the '# Review — <cycle> — iteration NN' title")
+    if "## Summary" not in text:
+        problems.append("missing '## Summary'")
+    if "## New findings" not in text:
+        problems.append("missing '## New findings' (write 'None.' under it if there are none)")
+    fs, cs, vs = F_HDR.findall(text), C_HDR.findall(text), V_HDR.findall(text)
+    for fid, it, _sev, cat in fs:
+        if int(it) != n:
+            problems.append(f"{fid}: findings in iteration {n} must be numbered F-{n:02d}-NN")
+        if cat not in categories:
+            problems.append(f"{fid}: category '{cat}' is not one of: {', '.join(categories)}")
+    for cid, it, _ref in cs:
+        if int(it) != n:
+            problems.append(f"{cid}: challenges in iteration {n} must be numbered C-{n:02d}-NN")
+    for vid, it, _ref, _st in vs:
+        if int(it) != n:
+            problems.append(f"{vid}: verifications in iteration {n} must be numbered V-{n:02d}-NN")
+    ids = [f[0] for f in fs] + [x[0] for x in cs] + [v[0] for v in vs]
+    if len(ids) != len(set(ids)):
+        problems.append("duplicate F-/C-/V- IDs")
+    if must_verify:
+        if "## Verification of previous fixes" not in text:
+            problems.append("missing '## Verification of previous fixes'")
+        missing = sorted(must_verify - {v[2] for v in vs})
+        if missing:
+            problems.append("no V- item for: " + ", ".join(missing))
+    loose = [l for l in re.findall(r"^### .*$", text, re.M)
+             if not (F_HDR.match(l) or C_HDR.match(l) or V_HDR.match(l))]
+    if loose:
+        problems.append("### headings not in a required form: " + "; ".join(loose[:5]))
+    return problems, fs, cs, vs, (rec.group(1) if rec else None)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_new(ctx: Ctx, a):
+    c = a.cycle
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,60}", c):
+        die("cycle names: lowercase letters, digits, '.', '_', '-' (e.g. 2026-09-26-auth-refactor)")
+    created = []
+    if not (ctx.rdir / "config.json").exists():
+        ctx.rdir.mkdir(parents=True, exist_ok=True)
+        (ctx.rdir / "config.json").write_text(json.dumps({"review_loop": 1}, indent=2) + "\n")
+        (ctx.rdir / "README.md").write_text((TEMPLATES / "README.md").read_text())
+        (ctx.rdir / "PROJECT.md").write_text((TEMPLATES / "PROJECT.md").read_text())
+        created += ["config.json", "README.md", "PROJECT.md"]
+        excl = ctx.root / ".git" / "info" / "exclude"
+        try:
+            cur = read(excl)
+            if ".opencode/" not in cur.split():
+                excl.parent.mkdir(parents=True, exist_ok=True)
+                with excl.open("a") as f:
+                    f.write(("" if cur.endswith("\n") or not cur else "\n") + ".opencode/\n")
+        except OSError:
+            pass
+    d = ctx.cdir(c)
+    if (d / "STATE.json").exists():
+        die(f"cycle {c} already exists")
+    d.mkdir(parents=True, exist_ok=True)
+    bp = d / "BRIEF.md"
+    if not bp.exists():
+        bp.write_text((TEMPLATES / "BRIEF.md").read_text().replace("{cycle}", c))
+        created.append(f"cycles/{c}/BRIEF.md")
+    print(f"REVIEW DIR: {ctx.rdir}")
+    for x in created:
+        print(f"  created {x}")
+    todo = [p for p in (ctx.rdir / "PROJECT.md", bp) if has_todo(read(p))]
+    print("NEXT: fill in every TODO in " + " and ".join(ctx.rel(p) for p in todo)
+          + f", then: review-loop init {c}" if todo else f"NEXT: review-loop init {c}")
+
+
+def cmd_init(ctx: Ctx, a):
+    c = a.cycle
+    d = ctx.cdir(c)
+    bp = d / "BRIEF.md"
+    if not bp.exists():
+        die(f"no brief: run review-loop new {c} and fill it in")
+    if (d / "STATE.json").exists():
+        die(f"cycle {c} is already open")
+    brief = bp.read_text()
+    heads = [h.lower() for h in re.findall(r"^## (.+)$", brief, re.M)]
+    missing = [k for k in REQUIRED_BRIEF if not any(k in h for h in heads)]
+    problems = []
+    if missing:
+        problems.append("BRIEF.md is missing sections about: " + ", ".join(missing))
+    if has_todo(brief):
+        problems.append("BRIEF.md still has TODO placeholders")
+    if not re.search(r"^\*\*Type:\*\*\s*(code|plan|other)\b", brief, re.M):
+        problems.append("BRIEF.md needs a line '**Type:** code', '**Type:** plan' or '**Type:** other'")
+    if has_todo(read(ctx.rdir / "PROJECT.md")):
+        problems.append(f"{ctx.rel(ctx.rdir / 'PROJECT.md')} still has TODO placeholders")
+    if problems:
+        die("; ".join(problems))
+    if ctx.current.exists():
+        cur = ctx.current.read_text().strip()
+        if cur and cur != c and (ctx.cdir(cur) / "STATE.json").exists() \
+                and ctx.load(cur)["status"] == "active" and not a.force:
+            die(f"cycle {cur} is still active; close it first (or pass --force to run both)")
+    prefix = ctx.rel(ctx.rdir) + "/"
+    dirty = ctx.dirty_outside(prefix)
+    if dirty:
+        die(f"{len(dirty)} uncommitted change(s) outside {prefix}: the reviewer reviews committed "
+            "work, and the per-round diffs need a clean start. Ask the user before committing "
+            "their work. First few: " + ", ".join(dirty[:8]), 3)
+    if not ctx.git("config", "user.email", check=False).strip():
+        die("git has no user.email configured here; commits would fail", 3)
+    cfg = ctx.cfg
+    s = {"cycle": c, "status": "active", "turn": "reviewer", "iteration": 1,
+         "max_iterations": a.max or cfg["max_iterations"],
+         "reviewer_model": a.reviewer or cfg["reviewer_model"],
+         "cycle_budget_usd": a.budget if a.budget is not None else cfg["cycle_budget_usd"],
+         "round_budget_usd": cfg["round_budget_usd"],
+         "round_timeout_min": cfg["round_timeout_min"],
+         "spent_usd": 0.0, "opened_at": now(), "base_commit": ctx.head(),
+         "commit_trailer": ctx.trailer,
+         "history": [{"event": "open", "at": now()}]}
+    ctx.idir(c, 1).mkdir(parents=True, exist_ok=True)
+    ctx.save(c, s)
+    ctx.current.write_text(c + "\n")
+    err = ctx.commit([ctx.rel(ctx.rdir)], f"review({c}): open cycle")
+    if err:
+        die(f"git commit failed: {err}", 1)
+    print(f"OPENED {c}: reviewer={s['reviewer_model']} max={s['max_iterations']} iterations "
+          f"budget=${s['cycle_budget_usd']:.2f} base={s['base_commit'][:10]}")
+    print("NEXT: review-loop review   (runs the reviewer; can take up to "
+          f"{s['round_timeout_min']} min, so run it in the background)")
+
+
+def run_reviewer(ctx: Ctx, s: dict, prompt_path: Path, out: Path, model: str, cap: float,
+                 session: str | None = None, fix_prompt: str | None = None):
+    """-> (exit_code, cost, session_id, message)"""
+    override = os.environ.get("REVIEW_LOOP_REVIEWER")
+    if override:           # test hook: a fake reviewer, called as CMD PROMPT_FILE OUT_FILE
+        cmd = shlex.split(override) + [str(prompt_path), str(out)]
+    else:
+        cmd = ["delegate-agent", "--mode", "plan", "--dir", str(ctx.root), "--out", str(out),
+               "--bare", "--model", model, "--max-cost", f"{cap:.4f}",
+               "--timeout", str(s["round_timeout_min"]),
+               "--title", f"review: {s['cycle']} iter {s['iteration']:02d}"]
+        if session:
+            cmd += ["--session", session, "--prompt", fix_prompt]
+        else:
+            cmd += ["--prompt-file", str(prompt_path)]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ctx.root)
+    both = r.stdout + "\n" + r.stderr
+    cost = sum(float(x) for x in re.findall(r"\bcost[= ]\$([\d.]+)", both)[:1])
+    sid = (re.findall(r"session[= ](ses_\w+)", both) or [None])[0]
+    msg = (r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or [""])[-1]
+    return r.returncode, cost, sid, msg
+
+
+def build_prompt(ctx: Ctx, s: dict) -> str:
+    c, n = s["cycle"], s["iteration"]
+    cats = ", ".join(f"`{x}`" for x in ctx.cfg["categories"])
+    proto = (TEMPLATES / "reviewer-protocol.md").read_text().replace("{categories}", cats)
+    parts = [proto, "---\n\n# Project notes\n\n" + read(ctx.rdir / "PROJECT.md"),
+             "---\n\n# Brief for this cycle\n\n" + read(ctx.cdir(c) / "BRIEF.md")]
+    rd = ctx.rel(ctx.rdir)
+    now_part = [f"---\n\n# This round\n\n- **Cycle:** `{c}`",
+                f"- **Iteration:** {n:02d} (at most {s['max_iterations']})",
+                f"- **Repository root:** `{ctx.root}` (your working directory)",
+                f"- **Commit when the cycle opened:** `{s['base_commit']}`",
+                f"- **Review records:** `{rd}/`. Earlier rounds are in "
+                f"`{rd}/cycles/{c}/iter-*/`; you may read them."]
+    if n == 1:
+        now_part.append("\nThis is the **first round**. Review the work the brief describes.")
+    else:
+        resp = [h for h in s["history"] if h["event"] == "response" and h["iteration"] == n - 1][-1]
+        rng = f"{resp['review_commit'][:12]}..{resp['commit'][:12]}" if resp.get("commit") else None
+        if rng:
+            stat = ctx.git("diff", "--stat", rng, "--", ".", f":(exclude){rd}", check=False).strip()
+            now_part.append(f"\n**The builder's changes since your last review:** "
+                            f"`git diff {rng} -- . ':(exclude){rd}'`\n\n```\n{stat or '(no code changes)'}\n```")
+        fs = ledger(ctx, c, n - 1)
+        verify = [f for f in fs.values() if f["status"] == "fix-pending"]
+        if verify:
+            now_part.append("\n## Verify these (one `V-` item each)\n")
+            now_part += [f"- **{f['id']}** · {f['sev']} · {f['cat']} (builder: {f['last_verdict']}): {f['title']}"
+                         for f in verify]
+        rows = [f"| {f['id']} | {f['sev']} | {f['cat']} | {f['status']} | {f['title'].replace('|', '/')} |"
+                for f in fs.values()]
+        if rows:
+            now_part.append("\n## Findings ledger so far (don't re-raise settled items)\n\n"
+                            "| id | severity | category | status | finding |\n|---|---|---|---|---|\n"
+                            + "\n".join(rows))
+        now_part.append(f"\n## Your review from iteration {n - 1:02d}\n\n"
+                        + read(ctx.idir(c, n - 1) / "review.md"))
+        now_part.append(f"\n## The builder's response to iteration {n - 1:02d}\n\n"
+                        + read(ctx.idir(c, n - 1) / "response.md"))
+    now_part.append(f"\n---\n\nNow do the review for iteration {n:02d}. Your **final message** must be "
+                    "the complete review in the exact format above, starting with "
+                    f"`# Review — {c} — iteration {n:02d}`. Don't write it to a file.")
+    parts.append("\n".join(now_part))
+    return "\n\n".join(parts) + "\n"
+
+
+def cmd_review(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    ctx.trailer = ctx.trailer or s.get("commit_trailer")
+    if s["status"] != "active":
+        die(f"cycle {c} is closed ({s['status']})")
+    if s["turn"] != "reviewer":
+        die(f"it is the builder's turn (iteration {s['iteration']}): write response.md, then review-loop respond")
+    n = s["iteration"]
+    prefix = ctx.rel(ctx.cdir(c)) + "/"
+    dirty = ctx.dirty_outside(prefix)
+    if dirty:
+        die(f"uncommitted changes outside {prefix}: " + ", ".join(dirty[:8])
+            + ". Hand over through `review-loop respond` (which commits), or discard them.", 3)
+    remaining = s["cycle_budget_usd"] - s["spent_usd"]
+    if remaining < 0.02:
+        die(f"cycle budget spent ({usd(s['spent_usd'])} of ${s['cycle_budget_usd']:.2f}). "
+            "Tell the user; either close with 'Outcome: budget-reached' or, with their approval, "
+            "review-loop adjust --budget N", 8)
+    model = a.model or s["reviewer_model"]
+    it = ctx.idir(c, n)
+    it.mkdir(parents=True, exist_ok=True)
+    prompt_path = it / "reviewer-prompt.md"
+    prompt_path.write_text(build_prompt(ctx, s))
+    out = it / "review.md"
+    must_verify = {f["id"] for f in ledger(ctx, c, n - 1).values() if f["status"] == "fix-pending"}
+
+    cap = min(s["round_budget_usd"], remaining)
+    print(f"REVIEWING {c} iteration {n:02d} with {model} (round cap ${cap:.2f}, "
+          f"timeout {s['round_timeout_min']} min)…", flush=True)
+    rc, cost, sid, msg = run_reviewer(ctx, s, prompt_path, out, model, cap)
+    total_cost, attempts = cost, 1
+    problems = []
+    if rc == 0:
+        problems = validate_review(read(out), n, must_verify, ctx.cfg["categories"])[0]
+        while problems and attempts <= ctx.cfg["format_retries"] and sid:
+            fix = ("Your review failed the automatic format check:\n- " + "\n- ".join(problems)
+                   + "\n\nReply with the COMPLETE corrected review (every section), in the exact format "
+                   "from the protocol. Change only what is needed to fix these problems.")
+            rc, cost, sid2, msg = run_reviewer(ctx, s, prompt_path, out, model,
+                                               max(0.05, min(cap, remaining - total_cost)), sid, fix)
+            total_cost += cost
+            attempts += 1
+            if rc != 0:
+                break
+            problems = validate_review(read(out), n, must_verify, ctx.cfg["categories"])[0]
+
+    s["spent_usd"] = round(s["spent_usd"] + total_cost, 6)
+    touched = ctx.dirty_outside(prefix)
+    if touched:
+        s["history"].append({"event": "review-failed", "iteration": n, "at": now(), "exit": 3,
+                             "error": "reviewer changed files: " + ", ".join(touched[:10]),
+                             "cost_usd": total_cost, "model": model, "session": sid})
+        ctx.save(c, s)
+        print(f"REVIEW REJECTED: the reviewer changed {len(touched)} file(s) outside its folder "
+              "(it must be read-only):")
+        for p in touched[:20]:
+            print(f"  {p}")
+        print("NEXT: tell the user. Inspect with `git status` / `git diff`, restore with "
+              "`git checkout -- <paths>` and remove stray untracked files (only the ones listed), "
+              "then retry review-loop review")
+        sys.exit(3)
+    if rc != 0 or problems:
+        code = rc if rc != 0 else 9
+        why = EXIT_MEANING.get(rc, f"exit {rc}") if rc != 0 else "review format still invalid"
+        detail = msg if rc != 0 else "; ".join(problems)
+        s["history"].append({"event": "review-failed", "iteration": n, "at": now(), "exit": code,
+                             "error": detail[:300], "cost_usd": total_cost, "attempts": attempts,
+                             "model": model, "session": sid})
+        ctx.save(c, s)
+        print(f"REVIEW FAILED: {why}. {detail}")
+        print(f"  cost this attempt ${total_cost:.4f}; cycle {usd(s['spent_usd'])} of ${s['cycle_budget_usd']:.2f}")
+        if code == 9:
+            print(f"  the raw output is at {ctx.rel(out)}")
+        print("NEXT: tell the user. Options: retry (review-loop review), another model "
+              "(review-loop review --model <alias>), or close: write CLOSE.md with "
+              "'Outcome: aborted' and run review-loop respond --decision close")
+        sys.exit(code)
+
+    text = read(out)
+    _, fs, cs, vs, rec = validate_review(text, n, must_verify, ctx.cfg["categories"])
+    counts = {sev: sum(1 for f in fs if f[2] == sev) for sev in SEVERITIES}
+    vcount = {st: sum(1 for v in vs if v[3] == st) for st in V_STATUSES}
+    s["history"].append({"event": "review", "iteration": n, "at": now(), "counts": counts,
+                         "challenges": len(cs), "verifications": vcount, "recommendation": rec,
+                         "cost_usd": total_cost, "attempts": attempts, "model": model, "session": sid})
+    s["turn"] = "builder"
+    ctx.save(c, s)
+    summary = ", ".join(f"{v} {k}" for k, v in counts.items() if v) or "no new findings"
+    err = ctx.commit([ctx.rel(ctx.cdir(c))], f"review({c}): iter {n:02d} review — {summary}; recommend {rec}")
+    if err:
+        s["turn"] = "reviewer"
+        s["history"].pop()
+        ctx.save(c, s)
+        die(f"git commit failed, so the turn was not handed over: {err}", 1)
+
+    reopened = [v for v in vs if v[3] != "verified"]
+    print(f"REVIEWED {c} iteration {n:02d}: {summary}; {len(cs)} challenge(s); "
+          f"{vcount['verified']} verified, {len(reopened)} not verified; recommend {rec}")
+    for fid, _it, sev, cat in fs:
+        print(f"  {fid} · {sev} · {cat}: {finding_title(text, fid)}")
+    for vid, _it, ref, st in reopened:
+        print(f"  {vid} · {ref} · {st}")
+    for cid, _it, ref in cs:
+        print(f"  {cid} · challenges {ref}")
+    print(f"  cost ${total_cost:.4f} (cycle {usd(s['spent_usd'])} of ${s['cycle_budget_usd']:.2f}) · "
+          f"file {ctx.rel(out)}")
+    need = [f[0] for f in fs] + [x[0] for x in cs] + [v[2] for v in reopened]
+    if need:
+        print(f"NEXT: verify each item yourself, fix what holds up, run the checks, write "
+              f"{ctx.rel(it / 'response.md')} with a verdict for: {', '.join(need)}; "
+              "then review-loop respond --decision continue (or close)")
+    else:
+        print(f"NEXT: nothing to answer. If converging, write CLOSE.md ('Outcome: converged') and "
+              f"{ctx.rel(it / 'response.md')} (a summary), then review-loop respond --decision close")
+
+
+def cmd_respond(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    ctx.trailer = ctx.trailer or s.get("commit_trailer")
+    if s["status"] != "active":
+        die(f"cycle {c} is closed ({s['status']})")
+    n = s["iteration"]
+    it = ctx.idir(c, n)
+    cp = ctx.cdir(c) / "CLOSE.md"
+
+    outcome = None
+    if a.decision == "close":
+        if not cp.exists():
+            die(f"write {ctx.rel(cp)} first (see the skill for its format)")
+        m = OUTCOME.search(cp.read_text())
+        if not m:
+            die("CLOSE.md needs a line 'Outcome: converged|cap-reached|budget-reached|aborted'")
+        outcome = m.group(1)
+
+    if s["turn"] == "reviewer":
+        # no review to answer: only an early stop is possible
+        if a.decision != "close" or outcome not in ("aborted", "budget-reached", "cap-reached"):
+            die("it is the reviewer's turn: run review-loop review, or close early with "
+                "Outcome: aborted / budget-reached")
+        verdicts, need = {}, []
+    else:
+        rp, resp = it / "review.md", it / "response.md"
+        if not resp.exists():
+            die(f"{ctx.rel(resp)} does not exist")
+        rtext, ptext = read(rp), resp.read_text()
+        need = {x[0] for x in F_HDR.findall(rtext)} | {x[0] for x in C_HDR.findall(rtext)} \
+            | {v[2] for v in V_HDR.findall(rtext) if v[3] != "verified"}
+        answered = {x[0] for x in R_HDR.findall(ptext)}
+        missing = sorted(need - answered)
+        if missing:
+            die("response.md has no verdict for: " + ", ".join(missing)
+                + " (headings: '### F-NN-MM · ACCEPT|REJECT|PARTIAL|BACKLOG')")
+        verdicts = {v: 0 for v in VERDICTS}
+        for _id, v in R_HDR.findall(ptext):
+            verdicts[v] += 1
+        if a.decision == "continue" and n >= s["max_iterations"]:
+            die(f"iteration cap ({s['max_iterations']}) reached: write CLOSE.md with "
+                "'Outcome: cap-reached' and close; tell the user what is still open", 8)
+
+    if outcome == "converged":
+        fs = ledger(ctx, c, n)
+        last = [h for h in s["history"] if h["event"] == "review"]
+        rec = last[-1]["recommendation"] if last else None
+        unverified = [f["id"] for f in fs.values()
+                      if f["sev"] in ("blocker", "major") and f["status"] not in
+                      ("verified", "rejected", "backlog", "disputed")]
+        blockers = []
+        if unverified:
+            blockers.append("blocker/major findings not verified by the reviewer: " + ", ".join(unverified))
+        if rec != "converge":
+            blockers.append(f"the reviewer's last recommendation was '{rec}'")
+        if blockers and not a.override:
+            die("; ".join(blockers) + ". Run another round (--decision continue), or if the user "
+                "agrees, pass --override 'reason' (and say why in CLOSE.md)")
+
+    head_before = ctx.head()
+    ev = {"event": "response", "iteration": n, "at": now(), "verdicts": verdicts,
+          "decision": a.decision, "review_commit": head_before}
+    if a.override:
+        ev["override"] = a.override
+    s["history"].append(ev)
+    if a.decision == "close":
+        s["status"], s["turn"] = outcome, "none"
+    else:
+        s["iteration"], s["turn"] = n + 1, "reviewer"
+        ctx.idir(c, n + 1).mkdir(exist_ok=True)
+    ctx.save(c, s)
+    summary = ", ".join(f"{v} {k.lower()}" for k, v in verdicts.items() if v) or "no verdicts"
+    label = f"iter {n:02d} response — {summary}" + (f"; close: {outcome}" if outcome else "")
+    err = ctx.commit([], f"review({c}): {label}")
+    if err:
+        s["history"].pop()
+        if a.decision == "close":
+            s["status"], s["turn"] = "active", ("builder" if verdicts or need else "reviewer")
+        else:
+            s["iteration"], s["turn"] = n, "builder"
+        ctx.save(c, s)
+        die(f"git commit failed, so nothing was handed over: {err}", 1)
+    if a.decision == "continue":
+        # the next round's diff range; saved now, committed with the next hand-over
+        ev["commit"] = ctx.head()
+        ctx.save(c, s)
+    if a.decision == "close":
+        fs = ledger(ctx, c, n)
+        by = {}
+        for f in fs.values():
+            by[f["status"]] = by.get(f["status"], 0) + 1
+        print(f"CLOSED {c}: {outcome} after {n} iteration(s); {len(fs)} finding(s) "
+              f"({', '.join(f'{v} {k}' for k, v in by.items()) or 'none'}); "
+              f"reviewer spend {usd(s['spent_usd'])}")
+        print(f"NEXT: report to the user from {ctx.rel(cp)}: outcome, what changed, open disputes, backlog")
+    else:
+        print(f"HANDED OVER {c} iteration {n:02d} ({summary}). Reviewer's turn: iteration {n + 1:02d}.")
+        print("NEXT: review-loop review")
+
+
+def cmd_status(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    print(f"{c}: {s['status']} · turn={s['turn']} · iteration {s['iteration']}/{s['max_iterations']} · "
+          f"reviewer={s['reviewer_model']} · spent {usd(s['spent_usd'])} of ${s['cycle_budget_usd']:.2f}")
+    for h in s["history"][-6:]:
+        extra = {k: v for k, v in h.items() if k not in ("event", "at", "session", "review_commit", "commit")}
+        print(f"  {h['at'][:16]} {h['event']:<14} {json.dumps(extra)[:150]}")
+    fs = ledger(ctx, c, s["iteration"])
+    if fs:
+        by = {}
+        for f in fs.values():
+            by[f["status"]] = by.get(f["status"], 0) + 1
+        print("  findings: " + ", ".join(f"{v} {k}" for k, v in by.items()))
+    if s["status"] != "active":
+        print(f"NEXT: closed. See {ctx.rel(ctx.cdir(c) / 'CLOSE.md')}")
+    elif s["turn"] == "reviewer":
+        print("NEXT: review-loop review")
+    else:
+        print(f"NEXT: write {ctx.rel(ctx.idir(c, s['iteration']) / 'response.md')}, then review-loop respond")
+
+
+def cmd_ledger(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    fs = ledger(ctx, c, s["iteration"])
+    if not fs:
+        print("no findings yet")
+    for f in fs.values():
+        print(f"{f['id']} · {f['sev']:<7} · {f['cat']:<16} · {f['status']:<11} · {f['title']}")
+
+
+def cmd_changes(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    resps = [h for h in s["history"] if h["event"] == "response" and h.get("commit")]
+    if a.iteration:
+        resps = [h for h in resps if h["iteration"] == a.iteration]
+    if not resps:
+        print(f"no builder changes yet; the cycle opened at {s['base_commit'][:12]}")
+        return
+    h = resps[-1]
+    rng = f"{h['review_commit'][:12]}..{h['commit'][:12]}"
+    rd = ctx.rel(ctx.rdir)
+    print(f"builder changes in iteration {h['iteration']:02d}: {rng}")
+    print(ctx.git("diff", "--stat", rng, "--", ".", f":(exclude){rd}", check=False))
+    print(f"full diff: git diff {rng} -- . ':(exclude){rd}'")
+
+
+def cmd_list(ctx: Ctx, a):
+    if not ctx.cycles.exists():
+        print(f"no cycles under {ctx.rdir}")
+        return
+    cur = read(ctx.current).strip()
+    for d in sorted(ctx.cycles.iterdir()):
+        sp = d / "STATE.json"
+        if sp.exists():
+            s = json.loads(sp.read_text())
+            print(f"{'*' if d.name == cur else ' '} {d.name:<40} {s['status']:<14} "
+                  f"iter {s['iteration']}/{s['max_iterations']}  {usd(s['spent_usd'])}")
+        else:
+            print(f"  {d.name:<40} (brief only)")
+
+
+def cmd_adjust(ctx: Ctx, a):
+    c = ctx.cycle_name(a.cycle)
+    s = ctx.load(c)
+    if s["status"] != "active":
+        die(f"cycle {c} is closed")
+    changed = {}
+    if a.budget is not None:
+        s["cycle_budget_usd"] = changed["cycle_budget_usd"] = a.budget
+    if a.max is not None:
+        s["max_iterations"] = changed["max_iterations"] = a.max
+    if a.model:
+        s["reviewer_model"] = changed["reviewer_model"] = a.model
+    if a.round_budget is not None:
+        s["round_budget_usd"] = changed["round_budget_usd"] = a.round_budget
+    if a.timeout is not None:
+        s["round_timeout_min"] = changed["round_timeout_min"] = a.timeout
+    if not changed:
+        die("nothing to change")
+    s["history"].append({"event": "adjust", "at": now(), **changed})
+    ctx.save(c, s)
+    print(f"ADJUSTED {c}: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="review-loop", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo")
+    ap.add_argument("--review-dir")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, cycle=True):
+        p = sub.add_parser(name)
+        if cycle:
+            p.add_argument("--cycle")
+        p.set_defaults(fn=fn)
+        return p
+
+    p = add("new", cmd_new, cycle=False); p.add_argument("cycle")
+    p = add("init", cmd_init, cycle=False); p.add_argument("cycle")
+    p.add_argument("--reviewer"); p.add_argument("--max", type=int)
+    p.add_argument("--budget", type=float); p.add_argument("--trailer")
+    p.add_argument("--force", action="store_true")
+    p = add("review", cmd_review); p.add_argument("--model")
+    p = add("respond", cmd_respond)
+    p.add_argument("--decision", choices=("continue", "close"), required=True)
+    p.add_argument("--override"); p.add_argument("--trailer")
+    add("status", cmd_status)
+    add("ledger", cmd_ledger)
+    p = add("changes", cmd_changes); p.add_argument("--iteration", type=int)
+    add("list", cmd_list, cycle=False)
+    p = add("adjust", cmd_adjust)
+    p.add_argument("--budget", type=float); p.add_argument("--max", type=int)
+    p.add_argument("--model"); p.add_argument("--round-budget", type=float)
+    p.add_argument("--timeout", type=float)
+    a = ap.parse_args()
+    try:
+        a.fn(Ctx(a), a)
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+
+if __name__ == "__main__":
+    main()

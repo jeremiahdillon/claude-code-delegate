@@ -1,0 +1,11 @@
+
+## Delegating to commodity models (OpenRouter / OpenCode)
+
+This machine can hand bounded work to cheap models, and the results are written to disk:
+- `delegate-inference`: one-shot, over files you already know.
+- `delegate-agent`: a headless OpenCode agent for discovery, review, or mechanical edits.
+
+The `delegate` skill covers tier and model choice, the handoff protocol, and exit codes.
+- **Ask the user once per session before the first delegated call.** Delegation spends their credits and sends content to third-party providers. It is available, not a default: do not reach for it unless the task clearly fits.
+- Read only the output's executive summary into context, and verify important claims before relying on them.
+- For an iterative second-model review of code, plans or documents, use the `adversarial-review` skill (`review-loop`, built on `delegate-agent`).

@@ -1,0 +1,78 @@
+{
+  "updated": "2026-09-26",
+  "source": "Artificial Analysis Intelligence Index + OpenRouter ZDR endpoint pricing, checked 2026-09-26. Re-check when a model is superseded; change 'defaults' to switch.",
+  "defaults": {
+    "inference": "default",
+    "agent": "default"
+  },
+  "limits": {
+    "max_cost_usd": 0.5,
+    "agent_timeout_min": 20,
+    "max_output_tokens": 16000
+  },
+  "opencode": {
+    "server": null,
+    "server_env_file": null,
+    "config": "~/.config/opencode/opencode.json"
+  },
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "key_env": "OPENROUTER_API_KEY",
+      "zdr": true,
+      "opencode_provider": "openrouter"
+    },
+    "google": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "GEMINI_API_KEY",
+      "zdr": false,
+      "opencode_provider": "google"
+    }
+  },
+  "aliases": {
+    "default": {
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4.1-flash",
+      "context": 1048576,
+      "note": "AA 39, ~237 tok/s. Fast; strongest cheap model on agentic + long-context work."
+    },
+    "value": {
+      "provider": "openrouter",
+      "model": "z-ai/glm-5.3-flash",
+      "context": 1048576,
+      "note": "AA 42 at ~half the price, but ~46 tok/s. Big background jobs."
+    },
+    "smart": {
+      "provider": "openrouter",
+      "model": "xiaomi/mimo-v2.6-pro",
+      "context": 1050000,
+      "note": "AA 46 (#1) at flash price. Slow; one ZDR provider. Hard reasoning."
+    },
+    "strong": {
+      "provider": "openrouter",
+      "model": "z-ai/glm-5.3",
+      "context": 1048576,
+      "note": "AA 45, ~10x price. When it matters and 'smart' is unavailable."
+    },
+    "gemini": {
+      "provider": "google",
+      "model": "gemini-3.8-flash",
+      "context": 1048576,
+      "price": {
+        "input": 0.75,
+        "output": 3.75
+      },
+      "note": "AA 41, ~330 tok/s, multimodal. Different-lab second opinion. No ZDR."
+    },
+    "lite": {
+      "provider": "google",
+      "model": "gemini-3.5-flash-lite",
+      "context": 1048576,
+      "price": {
+        "input": 0.3,
+        "output": 2.5
+      },
+      "note": "AA 22. Trivial bulk work: classify, tag, simple extraction. No ZDR."
+    }
+  }
+}

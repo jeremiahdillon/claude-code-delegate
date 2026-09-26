@@ -1,0 +1,14 @@
+{
+  "review_dir": "_review",
+  "reviewer_model": "default",
+  "max_iterations": 5,
+  "cycle_budget_usd": 2.0,
+  "round_budget_usd": 0.75,
+  "round_timeout_min": 45,
+  "format_retries": 2,
+  "categories": [
+    "intent", "correctness", "security", "robustness", "performance", "testing",
+    "consistency", "completeness", "feasibility", "over-engineering", "clarity",
+    "privacy", "settled-risk"
+  ]
+}
