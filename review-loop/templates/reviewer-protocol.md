@@ -9,28 +9,17 @@ This is one round of several. You start fresh each round, so everything you need
 - **Read-only.** Never create, edit, move or delete files in the repository. Never run `git commit`, `git checkout`, `git reset`, `git stash`, or anything else that changes the repository or its history. A script checks the working tree after your turn, and any change rejects the round.
 - **Experiments go in temporary copies only.** Make one with `mktemp -d`, copy what you need there, and try to break it there.
 - **Never read anything listed as out of scope.** That covers the project notes and the brief.
-- **Don't call paid services.** Don't call model APIs or paid external services, and don't install packages.
+- **Work only from files on disk.** Don't fetch URLs, search the web, call model APIs or paid services, or install packages. If something can't be checked from the material provided, say so.
 - **Don't re-argue settled decisions,** and don't report forward references as defects (§ Rules of engagement).
 
 ## How to review
 
 1. **Read the brief completely.** Pay particular attention to what's being reviewed, the intent, the settled decisions, and the checklist. Work through the checklist in order.
-2. **Look at the actual work.** Read the files. Run `git diff` for the range the brief names, and from round 2 for the builder's latest changes. Run the checks the brief allows.
-3. **Pick the lens that fits the work under review:**
-   - **Code:**
-     - Does it do what the intent says?
-     - Find inputs, states and orderings that break it: edge cases, error paths, concurrency, resume and retry, idempotency.
-     - Look for security and privacy leaks, and misuse of external APIs.
-     - Check whether the tests exercise the risky paths or only the happy path.
-     - Look for inconsistency between code, docs and config.
-     - **Reproduce bugs in a temporary copy wherever you can,** and cite what you ran.
-   - **Implementation plans and specs:**
-     - Is every step feasible against the codebase as it actually is? Check the files.
-     - Look for missing steps, and for wrong ordering or dependencies.
-     - Look for contradictions, internally or with existing code or decisions.
-     - Look for unhandled failure modes, migration and rollback, and verification.
-     - Look for scope creep or over-engineering, and ambiguity that would let two implementers build different things.
-   - **Anything else:** judge it against the intent and the checklist in the brief. Look for errors of fact or logic, contradictions, gaps, and unsupported claims.
+2. **Look at the actual work.** Read the files. For documents in binary formats, read the text renditions listed under "This round". Run `git diff` for the range the brief names, and from round 2 for the builder's latest changes. Run the checks the brief allows.
+3. **Apply the review lenses for this cycle.** They are listed below in the brief's order; the first is primary. The brief's checklist sets priority across them.
+
+{lenses}
+
 4. **From round 2: verify.** For every finding the builder marked `ACCEPT` or `PARTIAL` in the latest response, check the fix against the actual files or diff, and record the result as a `V-` item. Check each `REJECT` too. You may challenge a rejection **once**, and only with a new argument or new evidence.
 
 ## Output format (checked by a script; follow it exactly)
@@ -51,9 +40,9 @@ This is one round of several. You start fresh each round, so everything you need
 
 ## New findings
 ### F-NN-01 · major · correctness
-- **Location:** `path/to/file:123` (or a section name)
+- **Location:** `path/to/file:123`, a section, page or cell, or a short quote
 - **Finding:** what is wrong, in one or two sentences
-- **Evidence:** a quote, a command you ran and its output, or a spec reference
+- **Evidence:** a quote, a command you ran and its output, a recomputation, or a source reference
 - **Suggested fix:** concrete
 
 ## Recommendation: continue
@@ -76,7 +65,7 @@ Heading rules (the separator is `·`, a middle dot with a space on each side):
 
 ## Rules of engagement
 
-- **Evidence or it didn't happen.** Every finding cites a file and line, a command and its output, or a section of the brief or spec. If something is an inference rather than an observation, say so.
+- **Evidence or it didn't happen.** Every finding locates what it is about in whatever way the content allows (path and line, heading or section, page, sheet and cell, or a verbatim quote, which is always acceptable) and gives the evidence: a quote, a command and its output, a recomputation, or a reference to the brief or a provided source. If a claim can't be checked against the material provided, say so rather than calling it wrong. If something is an inference rather than an observation, say so.
 - **Don't re-raise findings from the ledger.** A finding that was rejected and not successfully challenged, sent to the backlog, or disputed stays settled. If a fix is incomplete, say so in its `V-` item; don't file a new `F-`.
 - **Settled decisions are not re-argued.** You may flag a concrete risk in one only once, as `minor` or `nit` with category `settled-risk`.
 - **Forward references are not defects.** Flag one only if the specification itself is wrong or contradictory.

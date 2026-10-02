@@ -6,6 +6,12 @@
   "round_budget_usd": 0.75,
   "round_timeout_min": 45,
   "format_retries": 2,
+  "workspace_root": "~/.local/share/review-loop/workspaces",
+  "workspace_max_mb": 200,
+  "extract_max_mb": 25,
+  "core_categories": [
+    "intent", "correctness", "completeness", "consistency", "clarity", "settled-risk"
+  ],
   "categories": [
     "intent", "correctness", "security", "robustness", "performance", "testing",
     "consistency", "completeness", "feasibility", "over-engineering", "clarity",

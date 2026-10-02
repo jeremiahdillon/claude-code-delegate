@@ -7,6 +7,8 @@ Behaviour comes from $FAKE (one scenario per call, consumed from a queue file):
   bad2         iteration-2 review missing the V- item for F-01-02 (format failure)
   credits      exit 4 like delegate-agent on HTTP 402
   vandal       writes a file outside the review dir, then a valid review
+  multi1       iteration-1 review using one category from the writing lens and one from analysis
+  badcat       iteration-1 review using a category no lens of a writing/analysis cycle allows
 Queue: $FAKE_QUEUE is a file of scenario names, one per line; each call pops the first.
 """
 import os
@@ -66,6 +68,11 @@ elif scenario == "good1":
     out.write_text(R1)
 elif scenario == "good2":
     out.write_text(R2.replace("{v2}", "### V-02-02 · F-01-02 · verified\ndocstring added.\n"))
+elif scenario == "multi1":
+    out.write_text(R1.replace("· major · correctness", "· major · argument")
+                     .replace("· minor · clarity", "· minor · reasoning"))
+elif scenario == "badcat":
+    out.write_text(R1.replace("· major · correctness", "· major · performance"))
 elif scenario == "bad2":
     out.write_text(R2.replace("{v2}", ""))
 print(f"DONE: {out}  model=fake mode=plan session=ses_fake{len(rest)} steps=1 tools=0 cost=$0.0100 time=0.1s")
