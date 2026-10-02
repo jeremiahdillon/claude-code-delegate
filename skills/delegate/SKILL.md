@@ -5,14 +5,16 @@ description: Delegate bounded inference or agent work to cheap commodity models 
 
 # Delegating to commodity models
 
-Two CLIs on PATH. Their config (`models.json`, `deny.txt`) sits in the tool's directory; `delegate-inference --list-models` prints its path.
+Two CLIs on PATH, plus `delegate-extract` for documents. Their config (`models.json`, `deny.txt`) sits in the tool's directory; `delegate-inference --list-models` prints its path.
 
 | Tool | Use when | Mechanism |
 |---|---|---|
 | `delegate-inference` | You already know the exact files/text to process. Single turn, no tools. | Direct API call (OpenRouter with zero-data-retention, or Google AI Studio) |
 | `delegate-agent` | Files must be discovered, or the task needs multi-step tool use (grep, reading around, running read-only commands), or mechanical edits. | Headless `opencode run --auto`. If an OpenCode server is configured, it attaches so the user can watch in the web UI |
 
-Both write the result to disk and print one line: `DONE: <path>  model=… cost=$… time=…s`. Nothing large comes back on stdout.
+`delegate-inference` accepts documents as well as text: docx, xlsx, pptx, odt/ods, html, pdf, doc/rtf (macOS) and images (OCR) are rendered as text first (spreadsheets as each cell's value and formula). `delegate-extract FILE…` does the same rendering on its own, to stdout or `--out-dir`; `delegate-extract --formats` shows what this machine supports.
+
+Both delegation tools write the result to disk and print one line: `DONE: <path>  model=… cost=$… time=…s`. Nothing large comes back on stdout.
 
 ## Consent (required)
 
@@ -21,7 +23,7 @@ Delegation spends the user's OpenRouter/Google credits and sends content to thir
 ## When delegation fits, and when it does not
 
 Good fits:
-- Digesting large documents, logs, transcripts or many files into notes you then read selectively.
+- Digesting large documents, logs, transcripts, spreadsheets, PDFs or many files into notes you then read selectively.
 - First-pass or adversarial review: a second model looking for problems in a diff, spec or design.
 - Discovery: "find where X is configured on this machine / in this repo and explain it."
 - Mechanical, easily verified edits: renames, reorganizing files, repetitive find-and-replace.
@@ -53,6 +55,7 @@ delegate-inference --files transcript.txt --prompt "..." --dry-run    # plan, to
 Flags: `--prompt | --prompt-file`, `--files` (`-` = stdin; the shell expands globs), `--model`, `--out`, `--bare`, `--max-cost` (default $0.50), `--max-tokens`, `--reasoning off|low|medium|high`, `--json`, `--chunk`, `--dry-run`.
 
 - It checks the OpenRouter key balance first, and refuses if the estimate exceeds `--max-cost`.
+- Documents that aren't plain text are extracted automatically; a format it can't render exits 2 with the reason.
 - If the input exceeds the model's context it **refuses** (exit 8) and tells you the size. Then either trim the input, pick a larger-context model, or pass `--chunk`. `--chunk` maps over chunks and merges the results, which can lose cross-chunk connections, so use it knowingly.
 
 ## delegate-agent
