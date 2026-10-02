@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""delegate-extract — render documents as text for models that only read text.
+
+Handles docx/pptx/xlsx, odt/ods/odp, html, pdf, doc/rtf (macOS) and images
+(OCR), with the standard library plus tools found on the machine. Spreadsheets
+show each cell's cached value and its formula. Files matching deny.txt are
+refused.
+
+Exit codes: 0 ok, 2 usage / unsupported format, 3 refused (deny list).
+
+Examples:
+  delegate-extract report.docx                 # to stdout
+  delegate-extract model.xlsx scan.pdf --out-dir /tmp/txt
+  delegate-extract --formats
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import delegate_common as dc  # noqa: E402
+import extract as ex  # noqa: E402
+
+FORMATS = """\
+docx pptx xlsx xlsm   standard library (xlsx: cached value + formula per cell)
+odt ods odp           standard library
+html htm              standard library
+txt md csv tsv json   passed through
+doc rtf webarchive    macOS textutil
+pdf                   macOS PDFKit (Xcode Command Line Tools), else pdftotext, else pypdf
+images, scanned pages tesseract, else macOS Vision (Command Line Tools)
+"""
+
+
+def main():
+    p = argparse.ArgumentParser(prog="delegate-extract", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="Examples:" + __doc__.split("Examples:")[1])
+    p.add_argument("paths", nargs="*")
+    p.add_argument("--out-dir", help="write <out-dir>/<file name>.md for each input instead of stdout")
+    p.add_argument("--formats", action="store_true", help="list supported formats and exit")
+    a = p.parse_args()
+    if a.formats:
+        print(FORMATS, end="")
+        print(f"swift helper available: {'yes' if ex.swift_available() else 'no'}")
+        return
+    if not a.paths:
+        p.error("give at least one file")
+    try:
+        files = dc.check_files(a.paths)
+    except dc.DelegateError as e:
+        dc.die(e.code, e.msg)
+    results = ex.extract_many(files)
+    failed = 0
+    out_dir = Path(a.out_dir).expanduser() if a.out_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        r = results[f]
+        if isinstance(r, ex.ExtractError):
+            dc.warn(f"{f}: {r}")
+            failed += 1
+            continue
+        text = r.render(f)
+        if out_dir:
+            dest = out_dir / (Path(f).name + ".md")
+            dest.write_text(text)
+            print(f"EXTRACTED: {f} -> {dest} ({r.method})")
+        else:
+            sys.stdout.write(text + ("\n" if len(files) > 1 else ""))
+        for w in r.warnings:
+            dc.warn(f"{f}: {w}")
+    if failed:
+        sys.exit(dc.EXIT_USAGE)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """delegate-inference — one-shot inference over known files, via a cheap model.
 
-Bundles --files with headers, sends one request (OpenRouter with zero-data-
+Bundles --files with headers (documents such as docx/xlsx/pdf are rendered
+as text first; see delegate-extract), sends one request (OpenRouter with zero-data-
 retention, or Google AI Studio), writes Markdown to --out, prints
   DONE: <path>  model=... in=... out=... cost=$... time=...s
 Exit codes: 0 ok, 2 usage, 3 refused (deny list), 4 no credits, 5 bad key,
@@ -26,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import delegate_common as dc  # noqa: E402
+import extract as ex  # noqa: E402
 
 CHARS_PER_TOKEN = 3.5          # conservative estimate for mixed prose/code
 EXPECTED_OUT_TOKENS = 4000     # output guess for cost estimates
@@ -72,16 +74,23 @@ def parse_args():
 # ---------------------------------------------------------------- input
 
 def load_inputs(files: list) -> list:
-    """-> [(label, text)]"""
+    """-> [(label, text)]. Documents that aren't plain text (docx, xlsx, pdf,
+    images, ...) are rendered as text by extract.py first."""
+    binary = [f for f in files if f != "-" and ex.needs_extract(f)]
+    extracted = ex.extract_many(binary) if binary else {}
     out = []
     for f in files:
         if f == "-":
             out.append(("<stdin>", sys.stdin.read()))
-            continue
-        raw = Path(f).read_bytes()
-        if b"\x00" in raw[:8192]:
-            raise dc.DelegateError(dc.EXIT_USAGE, f"{f} looks binary; convert it to text first")
-        out.append((f, raw.decode("utf-8", errors="replace")))
+        elif f in extracted:
+            r = extracted[f]
+            if isinstance(r, ex.ExtractError):
+                raise dc.DelegateError(dc.EXIT_USAGE, f"{f}: {r} (see delegate-extract --formats)")
+            for w in r.warnings:
+                dc.warn(f"{f}: {w}")
+            out.append((f"{f} (extracted: {r.method})", r.text))
+        else:
+            out.append((f, Path(f).read_bytes().decode("utf-8", errors="replace")))
     return out
 
 

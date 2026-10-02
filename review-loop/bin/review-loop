@@ -4,15 +4,22 @@
 Claude Code is the builder. The reviewer is a cheaper model from another lab,
 run one round at a time through delegate-agent (fresh session per round, plan
 mode, output captured to iter-NN/review.md). Every hand-over is a git commit.
+It reviews code, plans, and other work (writing, analysis, calculations,
+research) through combinable review lenses.
 
-  review-loop new <cycle>                      scaffold the review dir (first time) and the cycle's BRIEF.md
+  review-loop new <cycle> [--target PATH …] [--ref PATH …] [--lenses a,b]
+                  [--setup auto|in-place|init|workspace] [--workspace-root DIR] [--force]
+                                               scaffold the cycle; with --target, choose how the
+                                               work gets into git (prints ROOT: for later --repo)
   review-loop init <cycle> [--reviewer M] [--max N] [--budget USD] [--trailer T]
                                                open the cycle (BRIEF.md filled in, tree clean)
   review-loop review [--model M]               run one reviewer round; validate; commit
   review-loop respond --decision continue|close [--override REASON] [--trailer T]
                                                validate response.md (and CLOSE.md); commit the fixes
-  review-loop status | ledger | changes [--iteration N] | list
+  review-loop status | ledger | changes [--iteration N] | list | lenses
   review-loop adjust [--budget USD] [--max N] [--model M]   change an open cycle's limits (with user approval)
+  review-loop apply [--yes] [--include-new] [--include-deletes]
+                                               workspace cycles: copy changes back to the originals
 
 Global: --repo PATH (default: the git repo containing cwd), --review-dir DIR, --cycle C.
 Exit codes follow delegate-*: 0 ok, 1 failure, 2 usage/state, 3 refused,
@@ -23,23 +30,33 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 HOME_DIR = Path(__file__).resolve().parent.parent          # the review-loop/ directory
 TEMPLATES = HOME_DIR / "templates"
+LENS_DIR = TEMPLATES / "lenses"
 DEFAULTS = HOME_DIR / "defaults.json"
 DIR_CANDIDATES = ("_review", ".review", ".delegate/review")
 
 SEVERITIES = ("blocker", "major", "minor", "nit")
 VERDICTS = ("ACCEPT", "REJECT", "PARTIAL", "BACKLOG")
+SUMMARY_VERDICTS = ("ACCEPT", "PARTIAL", "REJECT", "BACKLOG")   # the order the round summary prints
 V_STATUSES = ("verified", "not-fixed", "regressed", "partially-fixed")
 OUTCOMES = ("converged", "cap-reached", "budget-reached", "aborted")
+SETUPS = ("in-place", "init", "workspace")
+LEGACY_TYPE = {"code": "code", "plan": "plan", "other": "general"}
+PROJECT_MANIFESTS = ("package.json", "pyproject.toml", "setup.py", "Cargo.toml", "go.mod",
+                     "Makefile", "pom.xml", "build.gradle", "Gemfile", "composer.json", "CMakeLists.txt")
+COPY_SKIP = {".git", "node_modules", ".venv", "__pycache__", ".DS_Store", ".opencode", ".delegate"}
+SUMMARY_START, SUMMARY_END = "<!-- round-summary:start -->", "<!-- round-summary:end -->"
 
 F_HDR = re.compile(r"^### (F-(\d{2})-\d{2}) · (blocker|major|minor|nit) · ([a-z][a-z-]*)\s*$", re.M)
 C_HDR = re.compile(r"^### (C-(\d{2})-\d{2}) · re (F-\d{2}-\d{2})\s*$", re.M)
@@ -47,6 +64,8 @@ V_HDR = re.compile(r"^### (V-(\d{2})-\d{2}) · (F-\d{2}-\d{2}) · (verified|not-
 R_HDR = re.compile(r"^### ([FC]-\d{2}-\d{2}) · (ACCEPT|REJECT|PARTIAL|BACKLOG)\s*$", re.M)
 REC = re.compile(r"^## Recommendation: (continue|converge)\s*$", re.M)
 OUTCOME = re.compile(r"^Outcome: (converged|cap-reached|budget-reached|aborted)\s*$", re.M)
+LENSES_LINE = re.compile(r"^\*\*Lenses:\*\*[ \t]*(.*)$", re.M)
+TYPE_LINE = re.compile(r"^\*\*Type:\*\*\s*(code|plan|other)\b", re.M)
 REQUIRED_BRIEF = ("what you are reviewing", "in scope", "out of scope", "intent",
                   "settled", "forward", "checks", "checklist")
 
@@ -64,18 +83,66 @@ def die(msg: str, code: int = 2):
     sys.exit(code)
 
 
+def run_git(cwd, *args, check=False) -> subprocess.CompletedProcess:
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"git {' '.join(args)} failed in {cwd}: {r.stderr.strip()}", 1)
+    return r
+
+
+def load_defaults() -> dict:
+    return json.loads(DEFAULTS.read_text())
+
+
+# ---------------------------------------------------------------- delegate lib (extract, deny list)
+
+_DLIB = None
+
+
+def delegate_lib():
+    """(extract module, delegate_common module) or None.
+
+    Found through delegate-extract on PATH (resolved through symlinks, then
+    ../lib), else the published repo's sibling delegate/lib."""
+    global _DLIB
+    if _DLIB is None:
+        cands = []
+        w = shutil.which("delegate-extract")
+        if w:
+            cands.append(Path(w).resolve().parent.parent / "lib")
+        cands.append(HOME_DIR.parent / "delegate" / "lib")
+        _DLIB = False
+        for c in cands:
+            if (c / "extract.py").exists():
+                sys.path.insert(0, str(c))
+                try:
+                    import delegate_common  # noqa: F401
+                    import extract
+                    _DLIB = (extract, delegate_common)
+                except ImportError:
+                    _DLIB = False
+                break
+    return _DLIB or None
+
+
+def deny_match(p: Path):
+    lib = delegate_lib()
+    return lib[1].denied(p) if lib else None
+
+
 # ---------------------------------------------------------------- context
 
 class Ctx:
-    def __init__(self, a):
-        start = Path(a.repo).expanduser().resolve() if a.repo else Path.cwd()
-        r = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            die(f"{start} is not in a git repository. review-loop commits every hand-over; "
-                "ask the user whether to `git init` it", 3)
-        self.root = Path(r.stdout.strip())
-        self.defaults = json.loads(DEFAULTS.read_text())
+    def __init__(self, a, root: Path | None = None):
+        if root is None:
+            start = Path(a.repo).expanduser().resolve() if a.repo else Path.cwd()
+            r = run_git(start, "rev-parse", "--show-toplevel")
+            if r.returncode != 0:
+                die(f"{start} is not in a git repository. review-loop commits every hand-over; "
+                    "pass --target to `new` to choose a setup, or ask the user whether to `git init` it", 3)
+            root = Path(r.stdout.strip())
+        self.root = Path(root).resolve()
+        self.defaults = load_defaults()
         self.rdir = self._find_dir(a.review_dir)
         cfg_path = self.rdir / "config.json"
         self.cfg = dict(self.defaults)
@@ -103,6 +170,9 @@ class Ctx:
             die(f"git {' '.join(args)} failed: {r.stderr.strip()}", 1)
         return r.stdout
 
+    def ignored(self, path: str) -> bool:
+        return run_git(self.root, "check-ignore", "-q", path).returncode == 0
+
     def dirty_outside(self, prefix: str) -> list:
         out = self.git("status", "--porcelain", "--untracked-files=all")
         bad = []
@@ -114,7 +184,14 @@ class Ctx:
         return bad
 
     def commit(self, add: list, message: str):
-        self.git("add", "-A", *add)
+        if add:
+            # git refuses to add an ignored path (e.g. --review-dir .delegate/review);
+            # such records simply stay out of the commit.
+            keep = [p for p in add if not self.ignored(p)]
+            if keep:
+                self.git("add", "-A", *keep)
+        else:
+            self.git("add", "-A")
         msg = message + (f"\n\n{self.trailer}" if self.trailer else "")
         r = subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=self.root,
                            capture_output=True, text=True)
@@ -124,6 +201,11 @@ class Ctx:
 
     def head(self) -> str:
         return self.git("rev-parse", "HEAD").strip()
+
+    def diff_excludes(self) -> list:
+        """Pathspecs for builder diffs: everything but the cycle records (extracts stay in)."""
+        rd = self.rel(self.rdir)
+        return ["--", ".", f":(exclude){rd}/cycles", f":(exclude){rd}/CURRENT"]
 
     # cycles
     def cycle_name(self, name):
@@ -155,6 +237,102 @@ def usd(x: float) -> str:
 
 def has_todo(text: str) -> bool:
     return bool(re.search(r"\bTODO\b", re.sub(r"<!--.*?-->", "", text, flags=re.S)))
+
+
+def ensure_excluded(root: Path, entries) -> None:
+    """Add entries to <root>/.git/info/exclude if missing."""
+    excl = root / ".git" / "info" / "exclude"
+    try:
+        cur = excl.read_text() if excl.exists() else ""
+        have = set(cur.split())
+        add = [e for e in entries if e not in have]
+        if add:
+            excl.parent.mkdir(parents=True, exist_ok=True)
+            with excl.open("a") as f:
+                f.write(("" if cur.endswith("\n") or not cur else "\n") + "\n".join(add) + "\n")
+    except OSError:
+        pass
+
+
+def ensure_identity(root: Path) -> None:
+    """A local fallback identity, only if git has none configured."""
+    if not run_git(root, "config", "user.email").stdout.strip():
+        run_git(root, "config", "user.email", "review-loop@localhost", check=True)
+    if not run_git(root, "config", "user.name").stdout.strip():
+        run_git(root, "config", "user.name", "review-loop", check=True)
+
+
+def sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- lenses
+
+def available_lenses(rdir: Path | None) -> list:
+    names = {p.stem for p in LENS_DIR.glob("*.md")}
+    if rdir is not None and (rdir / "lenses").is_dir():
+        names |= {p.stem for p in (rdir / "lenses").glob("*.md")}
+    return sorted(names)
+
+
+def load_lens(name: str, rdir: Path | None):
+    """-> (categories, body) or None. Project lenses override shipped ones."""
+    for d in ([rdir / "lenses"] if rdir is not None else []) + [LENS_DIR]:
+        p = d / f"{name}.md"
+        if p.exists():
+            text = p.read_text()
+            cats, body = [], text
+            m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
+            if m:
+                body = text[m.end():]
+                cm = re.search(r"^categories:[ \t]*(.*)$", m.group(1), re.M)
+                if cm:
+                    cats = [c.strip() for c in cm.group(1).split(",") if c.strip()]
+            return cats, body.strip()
+    return None
+
+
+def parse_lens_list(value: str) -> list:
+    return [x.strip() for x in re.split(r"[,\s]+", value or "") if x.strip()]
+
+
+def brief_lenses(brief: str):
+    """-> (lenses, legacy) from a brief; (None, None) if it declares neither form."""
+    m = LENSES_LINE.search(brief)
+    if m and parse_lens_list(m.group(1)) and not has_todo(m.group(1)):
+        return parse_lens_list(m.group(1)), False
+    t = TYPE_LINE.search(brief)
+    if t:
+        return [LEGACY_TYPE[t.group(1)]], True
+    return None, None
+
+
+def compute_categories(lenses: list, legacy: bool, rdir: Path, cfg: dict) -> list:
+    base = list(cfg["categories"]) if legacy else list(cfg.get("core_categories")
+                                                        or load_defaults()["core_categories"])
+    for name in lenses:
+        lens = load_lens(name, rdir)
+        base += lens[0] if lens else []
+    out = []
+    for c in base:
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def cycle_categories(ctx: Ctx, s: dict) -> list:
+    return s.get("categories") or ctx.cfg["categories"]
+
+
+def cycle_lenses(ctx: Ctx, s: dict) -> list:
+    if s.get("lenses"):
+        return s["lenses"]
+    lenses, _ = brief_lenses(read(ctx.cdir(s["cycle"]) / "BRIEF.md"))   # cycles opened before lenses
+    return lenses or ["general"]
 
 
 # ---------------------------------------------------------------- parsing + ledger
@@ -249,43 +427,430 @@ def validate_review(text: str, n: int, must_verify: set, categories: list):
     return problems, fs, cs, vs, (rec.group(1) if rec else None)
 
 
-# ---------------------------------------------------------------- commands
+# ---------------------------------------------------------------- round summary
 
-def cmd_new(ctx: Ctx, a):
+def round_summary(s: dict) -> str:
+    """Markdown table: per iteration, findings by severity, fixes verified,
+    builder verdicts, the reviewer's recommendation and the cost (failed
+    attempts included)."""
+    iters = sorted({h["iteration"] for h in s["history"] if h["event"] in ("review", "review-failed")})
+    if not iters:
+        return "No reviewer rounds ran."
+    rows = ["| Round | Blocker | Major | Minor | Nit | Fixes verified | Builder: accept / partial / reject / backlog "
+            "| Recommendation | Cost |", "|---|---|---|---|---|---|---|---|---|"]
+    tot = {k: 0 for k in SEVERITIES}
+    tv = tvn = 0
+    tverd = {v: 0 for v in VERDICTS}
+    tcost, failed = 0.0, 0
+    for n in iters:
+        evs = [h for h in s["history"] if h.get("iteration") == n]
+        cost = sum(h.get("cost_usd") or 0 for h in evs if h["event"] in ("review", "review-failed"))
+        nfail = sum(1 for h in evs if h["event"] == "review-failed")
+        failed += nfail
+        tcost += cost
+        rv = [h for h in evs if h["event"] == "review"]
+        if rv:
+            r = rv[-1]
+            counts = r.get("counts", {})
+            vc = r.get("verifications", {})
+            nv, nall = vc.get("verified", 0), sum(vc.values())
+            tv, tvn = tv + nv, tvn + nall
+            ver = f"{nv} of {nall}" if nall else "—"
+            rec = r.get("recommendation") or "—"
+            for k in SEVERITIES:
+                tot[k] += counts.get(k, 0)
+            sev = [str(counts.get(k, 0)) for k in SEVERITIES]
+        else:
+            sev, ver, rec = ["—"] * 4, "—", "(failed)"
+        resp = [h for h in evs if h["event"] == "response"]
+        if resp:
+            vd = resp[-1].get("verdicts", {})
+            for k in VERDICTS:
+                tverd[k] += vd.get(k, 0)
+            verd = " / ".join(str(vd.get(k, 0)) for k in SUMMARY_VERDICTS)
+        else:
+            verd = "—"
+        note = f" ({nfail} failed attempt{'s' if nfail != 1 else ''})" if nfail else ""
+        rows.append(f"| {n} | " + " | ".join(sev) + f" | {ver} | {verd} | {rec} | ${cost:.4f}{note} |")
+    rows.append("| **Total** | " + " | ".join(f"**{tot[k]}**" for k in SEVERITIES)
+                + f" | **{tv} of {tvn}** | **" + " / ".join(str(tverd[k]) for k in SUMMARY_VERDICTS)
+                + f"** | | **${tcost:.4f}** |")
+    out = "\n".join(rows)
+    if failed:
+        out += f"\n\nCosts include {failed} failed reviewer attempt(s)."
+    return out
+
+
+def write_round_summary(cp: Path, s: dict):
+    block = f"{SUMMARY_START}\n## Round summary\n\n{round_summary(s)}\n{SUMMARY_END}"
+    text = read(cp)
+    if SUMMARY_START in text and SUMMARY_END in text:
+        text = re.sub(re.escape(SUMMARY_START) + r".*?" + re.escape(SUMMARY_END), lambda _m: block, text, flags=re.S)
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    cp.write_text(text)
+
+
+# ---------------------------------------------------------------- setup decision (new --target)
+
+def git_top(p: Path):
+    d = p if p.is_dir() else p.parent
+    r = run_git(d, "rev-parse", "--show-toplevel")
+    return Path(r.stdout.strip()).resolve() if r.returncode == 0 else None
+
+
+def is_ignored(top: Path, p: Path) -> bool:
+    return run_git(top, "check-ignore", "-q", str(p)).returncode == 0
+
+
+def tree_dirty(top: Path) -> list:
+    r = run_git(top, "status", "--porcelain", "--untracked-files=all")
+    out = []
+    for line in r.stdout.splitlines():
+        p = line[3:].split(" -> ")[-1].strip('"')
+        if p.startswith(tuple(c + "/" for c in DIR_CANDIDATES) + (".opencode/", ".delegate/")):
+            continue
+        out.append(p)
+    return out
+
+
+def row5_eligible(targets: list) -> bool:
+    return (len(targets) == 1 and targets[0].is_dir()
+            and any((targets[0] / m).exists() for m in PROJECT_MANIFESTS))
+
+
+def decide(targets: list, lenses: list) -> dict:
+    """§5.2 of the plan: -> {row, setup, ask, reason, top}"""
+    tops = [git_top(t) for t in targets]
+    for t, top in zip(targets, tops):
+        if top and is_ignored(top, t):
+            return {"row": 1, "setup": "workspace", "ask": False, "top": None,
+                    "reason": f"{t} is git-ignored in {top}, so its changes would never show in git"}
+    uniq = set(tops)
+    if len(uniq) > 1:
+        return {"row": 2, "setup": "workspace", "ask": True, "top": None,
+                "reason": "the targets span several repositories or mix git and non-git paths"}
+    top = tops[0]
+    if top:
+        dirty = tree_dirty(top)
+        if not dirty:
+            return {"row": 3, "setup": "in-place", "ask": False, "top": top,
+                    "reason": f"the targets are tracked in {top}, and its working tree is clean"}
+        return {"row": 4, "setup": "in-place", "ask": True, "top": top,
+                "reason": f"{top} has {len(dirty)} uncommitted change(s) (e.g. {', '.join(dirty[:3])}); "
+                          "the user's work must be committed first, or use a workspace copy"}
+    if row5_eligible(targets) and set(lenses) & {"code", "plan"}:
+        return {"row": 5, "setup": "init", "ask": True, "top": None,
+                "reason": f"{targets[0]} is not in git but looks like a project; `git init` there "
+                          "would change the user's folder"}
+    return {"row": 6, "setup": "workspace", "ask": False, "top": None,
+            "reason": "the targets are not in git; they will be copied into a workspace repo"}
+
+
+def unique_name(taken: set, base: str) -> str:
+    stem, ext = os.path.splitext(base)
+    if base.startswith(".") and not ext:
+        stem, ext = base, ""
+    name, k = base, 2
+    while name in taken:
+        name, k = f"{stem}-{k}{ext}", k + 1
+    taken.add(name)
+    return name
+
+
+def copy_input(src: Path, dest: Path, files: dict, rel_prefix: str, skipped: list):
+    """Copy a file or directory tree, skipping COPY_SKIP and deny-listed files.
+    Records {in-tree relative path: {original, sha256}} in files."""
+    if src.is_file():
+        if deny_match(src):
+            skipped.append(f"{src} (deny list)")
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        files[rel_prefix] = {"original": str(src), "sha256": sha256(dest)}
+        return
+    for dp, dns, fns in os.walk(src):
+        dns[:] = [d for d in dns if d not in COPY_SKIP]
+        for fn in fns:
+            s = Path(dp) / fn
+            rel = s.relative_to(src)
+            if fn in COPY_SKIP or s.is_symlink():
+                if s.is_symlink():
+                    skipped.append(f"{s} (symlink)")
+                continue
+            if deny_match(s):
+                skipped.append(f"{s} (deny list)")
+                continue
+            d = dest / rel
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, d)
+            files[f"{rel_prefix}/{rel.as_posix()}"] = {"original": str(s), "sha256": sha256(d)}
+
+
+def tree_bytes(paths: list) -> int:
+    total = 0
+    for p in paths:
+        if p.is_file():
+            total += p.stat().st_size
+            continue
+        for dp, dns, fns in os.walk(p):
+            dns[:] = [d for d in dns if d not in COPY_SKIP]
+            total += sum((Path(dp) / f).stat().st_size for f in fns
+                         if f not in COPY_SKIP and not (Path(dp) / f).is_symlink())
+    return total
+
+
+def make_workspace(a, cycle: str, targets: list, refs: list, defaults: dict) -> tuple:
+    """-> (workspace root, target in-tree paths, ref in-tree paths, mapping)"""
+    root_dir = Path(a.workspace_root or defaults["workspace_root"]).expanduser()
+    h = hashlib.sha256("\n".join(sorted(str(p) for p in targets + refs)).encode()).hexdigest()[:8]
+    ws = root_dir / f"{cycle}-{h}"
+    if ws.exists():
+        die(f"workspace {ws} already exists; it is never reused or overwritten. Pick another cycle "
+            "name, or remove it after checking nothing in it is needed", 2)
+    size = tree_bytes(targets + refs)
+    cap = defaults.get("workspace_max_mb", 200)
+    if size > cap * 1024 * 1024 and not a.force:
+        die(f"the inputs total {size / 1048576:.0f} MB, over workspace_max_mb ({cap}); the copy is "
+            "committed to git. Narrow the targets, or pass --force with the user's approval", 3)
+    ws.mkdir(parents=True)
+    run_git(ws, "init", "-q", check=True)
+    ensure_identity(ws)
+    ensure_excluded(ws, [".opencode/", ".delegate/"])
+    files, skipped, mapping = {}, [], []
+    tin, rin = [], []
+    for role, items, sub, acc in (("target", targets, "work", tin), ("ref", refs, "ref", rin)):
+        taken = set()
+        for p in items:
+            name = unique_name(taken, p.name)
+            rel = f"{sub}/{name}"
+            copy_input(p, ws / rel, files, rel, skipped)
+            acc.append(rel)
+            mapping.append({"role": role, "original": str(p), "in_tree": rel,
+                            "kind": "dir" if p.is_dir() else "file"})
+    (ws / "SOURCES.json").write_text(json.dumps(
+        {"copied_at": now(), "inputs": mapping, "files": files}, indent=2) + "\n")
+    run_git(ws, "add", "-A", check=True)
+    run_git(ws, "commit", "-q", "-m", f"review({cycle}): workspace snapshot", check=True)
+    if skipped:
+        print(f"SKIPPED {len(skipped)} file(s) while copying:")
+        for x in skipped[:30]:
+            print(f"  {x}")
+    return ws, tin, rin, mapping
+
+
+def init_in_place(target: Path, cycle: str):
+    run_git(target, "init", "-q", check=True)
+    ensure_identity(target)
+    denied = []
+    for dp, dns, fns in os.walk(target):
+        dns[:] = [d for d in dns if d != ".git"]
+        for fn in fns:
+            p = Path(dp) / fn
+            if deny_match(p):
+                denied.append(p.relative_to(target).as_posix())
+    ensure_excluded(target, [".opencode/", ".delegate/"] + ["/" + d for d in denied])
+    if denied:
+        print(f"EXCLUDED from git (deny list): {', '.join(denied[:20])}")
+    run_git(target, "add", "-A", check=True)
+    run_git(target, "commit", "-q", "-m", f"review({cycle}): initial snapshot", check=True)
+
+
+def cmd_new(a):
     c = a.cycle
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,60}", c):
         die("cycle names: lowercase letters, digits, '.', '_', '-' (e.g. 2026-09-26-auth-refactor)")
+    targets = [Path(t).expanduser().resolve() for t in a.target or []]
+    refs = [Path(t).expanduser().resolve() for t in a.ref or []]
+    for p in targets + refs:
+        if not p.exists():
+            die(f"no such file or directory: {p}")
+    lenses = parse_lens_list(a.lenses) if a.lenses else []
+    unknown = [x for x in lenses if x not in available_lenses(None) and not load_lens(x, None)]
+    setup_rec = {"setup": "in-place", "row": None, "lenses": lenses, "row5_eligible": False,
+                 "inputs": {"targets": [str(p) for p in targets], "refs": [str(p) for p in refs]}}
+    mapping = []
+    if not targets:
+        if a.setup not in ("auto", "in-place"):
+            die("--setup needs --target (without --target the cycle reviews the current repo in place)")
+        ctx = Ctx(a)
+        tin = []
+    else:
+        if not lenses and a.setup == "auto":
+            die("--lenses is required with --target: the setup decision depends on them "
+                f"(available: {', '.join(available_lenses(None))})")
+        if unknown:
+            # project lenses can't be checked before the root exists; init validates them
+            print(f"NOTE: lens(es) {', '.join(unknown)} are not shipped lenses; init will look in "
+                  "<review-dir>/lenses/")
+        d = decide(targets, lenses)
+        setup_rec.update(row=d["row"], row5_eligible=row5_eligible(targets))
+        setup = d["setup"] if a.setup == "auto" else a.setup
+        print(f"SETUP: {setup} (decision row {d['row']}: {d['reason']})")
+        if a.setup == "auto" and d["ask"]:
+            opts = {1: [], 2: ["workspace"], 4: ["in-place (after the user's work is committed)", "workspace"],
+                    5: ["init", "workspace"]}.get(d["row"], [])
+            print(f"NEEDS DECISION: {d['reason']}. Ask the user, then re-run with one of: "
+                  + ", ".join(f"--setup {o}" for o in opts))
+            sys.exit(2)
+        if setup == "in-place":
+            tops = {git_top(t) for t in targets}
+            if len(tops) != 1 or None in tops:
+                die("in-place needs every target inside one git repository; use --setup workspace", 2)
+            top = tops.pop()
+            if any(is_ignored(top, t) for t in targets):
+                die("a target is git-ignored, so in-place can't track it; use --setup workspace", 2)
+            ctx = Ctx(a, root=top)
+            if a.repo and Path(a.repo).expanduser().resolve() != top:
+                print(f"NOTE: using the target's repository {top}, not --repo {a.repo}")
+            tin = [os.path.relpath(t, top) for t in targets]
+        elif setup == "init":
+            if len(targets) != 1 or not targets[0].is_dir() or git_top(targets[0]):
+                die("init needs a single target directory that is not in git", 2)
+            init_in_place(targets[0], c)
+            ctx = Ctx(a, root=targets[0])
+            tin = ["."]
+        else:
+            ws, tin, rin, mapping = make_workspace(a, c, targets, refs, load_defaults())
+            ctx = Ctx(a, root=ws)
+            setup_rec.update(setup="workspace", targets=tin, refs=rin)
+        setup_rec["setup"] = setup
+
+    # review dir scaffolding (every run: the excludes may predate this version)
     created = []
+    ensure_excluded(ctx.root, [".opencode/", ".delegate/"])
     if not (ctx.rdir / "config.json").exists():
         ctx.rdir.mkdir(parents=True, exist_ok=True)
         (ctx.rdir / "config.json").write_text(json.dumps({"review_loop": 1}, indent=2) + "\n")
         (ctx.rdir / "README.md").write_text((TEMPLATES / "README.md").read_text())
         (ctx.rdir / "PROJECT.md").write_text((TEMPLATES / "PROJECT.md").read_text())
         created += ["config.json", "README.md", "PROJECT.md"]
-        excl = ctx.root / ".git" / "info" / "exclude"
-        try:
-            cur = read(excl)
-            if ".opencode/" not in cur.split():
-                excl.parent.mkdir(parents=True, exist_ok=True)
-                with excl.open("a") as f:
-                    f.write(("" if cur.endswith("\n") or not cur else "\n") + ".opencode/\n")
-        except OSError:
-            pass
     d = ctx.cdir(c)
     if (d / "STATE.json").exists():
         die(f"cycle {c} already exists")
     d.mkdir(parents=True, exist_ok=True)
+
+    # references for in-place/init setups
+    if setup_rec["setup"] != "workspace":
+        rin, taken = [], set()
+        for p in refs:
+            try:
+                rin.append(str(p.relative_to(ctx.root)))
+                mapping.append({"role": "ref", "original": str(p), "in_tree": rin[-1],
+                                "kind": "dir" if p.is_dir() else "file"})
+                continue
+            except ValueError:
+                pass
+            if not ctx.ignored(".delegate/ref"):
+                die("can't copy references into .delegate/ref: it is not git-ignored here "
+                    "(a .gitignore rule may re-include it); they would be committed", 3)
+            rel = f".delegate/ref/{c}/{unique_name(taken, p.name)}"
+            skipped = []
+            copy_input(p, ctx.root / rel, {}, rel, skipped)
+            for x in skipped:
+                print(f"  skipped {x}")
+            rin.append(rel)
+            mapping.append({"role": "ref", "original": str(p), "in_tree": rel,
+                            "kind": "dir" if p.is_dir() else "file"})
+        for t, rel in zip(targets, tin):
+            mapping.append({"role": "target", "original": str(t), "in_tree": rel,
+                            "kind": "dir" if t.is_dir() else "file"})
+        setup_rec.update(targets=tin, refs=rin)
+    setup_rec.update(root=str(ctx.root), mapping=mapping)
+    if targets or refs:
+        (d / "SETUP.json").write_text(json.dumps(setup_rec, indent=2) + "\n")
+
     bp = d / "BRIEF.md"
     if not bp.exists():
-        bp.write_text((TEMPLATES / "BRIEF.md").read_text().replace("{cycle}", c))
+        bp.write_text((TEMPLATES / "BRIEF.md").read_text()
+                      .replace("{cycle}", c)
+                      .replace("{available}", ", ".join(available_lenses(ctx.rdir)))
+                      .replace("{lenses}", ", ".join(lenses) if lenses else "TODO"))
         created.append(f"cycles/{c}/BRIEF.md")
+    print(f"ROOT: {ctx.root}")
     print(f"REVIEW DIR: {ctx.rdir}")
     for x in created:
         print(f"  created {x}")
+    if setup_rec.get("targets") or setup_rec.get("refs"):
+        print("IN TREE: targets " + (", ".join(setup_rec.get("targets") or []) or "—")
+              + "; references " + (", ".join(setup_rec.get("refs") or []) or "—"))
     todo = [p for p in (ctx.rdir / "PROJECT.md", bp) if has_todo(read(p))]
+    repo = f" --repo {shlex.quote(str(ctx.root))}" if targets else ""
     print("NEXT: fill in every TODO in " + " and ".join(ctx.rel(p) for p in todo)
-          + f", then: review-loop init {c}" if todo else f"NEXT: review-loop init {c}")
+          + f", then: review-loop{repo} init {c}" if todo else f"NEXT: review-loop{repo} init {c}")
 
+
+# ---------------------------------------------------------------- extraction
+
+def expand(ctx: Ctx, rel: str) -> list:
+    full = ctx.root / rel
+    if full.is_file():
+        return [rel]
+    if not full.is_dir():
+        return []
+    if rel == ".delegate" or rel.startswith(".delegate/"):
+        out = []
+        for dp, dns, fns in os.walk(full):
+            out += [os.path.relpath(Path(dp) / f, ctx.root) for f in fns]
+        return sorted(out)
+    # tracked plus untracked-but-not-ignored: at `respond` the builder's new files
+    # aren't committed yet; files deleted from the tree are dropped
+    r = ctx.git("ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", rel, check=False)
+    return sorted({p for p in r.split("\0") if p and (ctx.root / p).is_file()})
+
+
+def refresh_extracts(ctx: Ctx, s: dict) -> list:
+    """Re-render binary targets/refs to <review-dir>/extract/<path>.md. -> warnings"""
+    rels = list(s.get("targets") or []) + list(s.get("refs") or [])
+    if not rels:
+        return []
+    lib = delegate_lib()
+    if not lib:
+        return ["delegate-extract not found (not on PATH, no sibling delegate/lib): "
+                "binary files were not rendered as text"]
+    ex = lib[0]
+    rd = ctx.rel(ctx.rdir)
+    files = []
+    for r in rels:
+        files += [f for f in expand(ctx, r) if not f.startswith(rd + "/")]
+    cap = ctx.cfg.get("extract_max_mb", 25) * 1024 * 1024
+    want, warns = [], []
+    for f in files:
+        p = ctx.root / f
+        if not ex.needs_extract(p):
+            continue
+        if p.stat().st_size > cap:
+            warns.append(f"{f}: skipped, larger than extract_max_mb")
+            continue
+        want.append(f)
+    out_dir = ctx.rdir / "extract"
+    results = ex.extract_many([ctx.root / f for f in want]) if want else {}
+    keep = set()
+    for f in want:
+        r = results[str(ctx.root / f)]
+        dest = out_dir / (f + ".md")
+        keep.add(dest.resolve())
+        if isinstance(r, ex.ExtractError):
+            warns.append(f"{f}: {r}")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(r.render(f))
+        warns += [f"{f}: {w}" for w in r.warnings]
+    if out_dir.exists():
+        for p in sorted(out_dir.rglob("*"), reverse=True):
+            if p.is_file() and p.resolve() not in keep:
+                p.unlink()
+            elif p.is_dir() and not any(p.iterdir()):
+                p.rmdir()
+    return warns
+
+
+def extract_list(ctx: Ctx) -> list:
+    d = ctx.rdir / "extract"
+    return sorted(ctx.rel(p) for p in d.rglob("*.md")) if d.exists() else []
+
+
+# ---------------------------------------------------------------- commands
 
 def cmd_init(ctx: Ctx, a):
     c = a.cycle
@@ -303,10 +868,24 @@ def cmd_init(ctx: Ctx, a):
         problems.append("BRIEF.md is missing sections about: " + ", ".join(missing))
     if has_todo(brief):
         problems.append("BRIEF.md still has TODO placeholders")
-    if not re.search(r"^\*\*Type:\*\*\s*(code|plan|other)\b", brief, re.M):
-        problems.append("BRIEF.md needs a line '**Type:** code', '**Type:** plan' or '**Type:** other'")
+    lenses, legacy = brief_lenses(brief)
+    if lenses is None:
+        problems.append("BRIEF.md needs a line '**Lenses:** <lens>[, <lens>…]' (or the legacy "
+                        "'**Type:** code|plan|other')")
+    else:
+        bad = [x for x in lenses if not load_lens(x, ctx.rdir)]
+        if bad:
+            problems.append(f"unknown lens(es): {', '.join(bad)}; available: "
+                            + ", ".join(available_lenses(ctx.rdir)))
     if has_todo(read(ctx.rdir / "PROJECT.md")):
         problems.append(f"{ctx.rel(ctx.rdir / 'PROJECT.md')} still has TODO placeholders")
+    setup = json.loads(read(d / "SETUP.json") or "{}")
+    if lenses and setup.get("row") in (5, 6) and setup.get("row5_eligible"):
+        now_cp = bool(set(lenses) & {"code", "plan"})
+        if (setup["row"] == 5) != now_cp:
+            problems.append("the brief's lenses no longer match the setup chosen at `new` "
+                            f"(row {setup['row']}: {'needs' if setup['row'] == 5 else 'excludes'} a "
+                            "code or plan lens); re-run `review-loop new` with the new lenses")
     if problems:
         die("; ".join(problems))
     if ctx.current.exists():
@@ -329,9 +908,13 @@ def cmd_init(ctx: Ctx, a):
          "cycle_budget_usd": a.budget if a.budget is not None else cfg["cycle_budget_usd"],
          "round_budget_usd": cfg["round_budget_usd"],
          "round_timeout_min": cfg["round_timeout_min"],
+         "lenses": lenses, "categories": compute_categories(lenses, legacy, ctx.rdir, cfg),
+         "setup": setup.get("setup", "in-place"),
+         "targets": setup.get("targets", []), "refs": setup.get("refs", []),
          "spent_usd": 0.0, "opened_at": now(), "base_commit": ctx.head(),
          "commit_trailer": ctx.trailer,
          "history": [{"event": "open", "at": now()}]}
+    warns = refresh_extracts(ctx, s)
     ctx.idir(c, 1).mkdir(parents=True, exist_ok=True)
     ctx.save(c, s)
     ctx.current.write_text(c + "\n")
@@ -339,7 +922,12 @@ def cmd_init(ctx: Ctx, a):
     if err:
         die(f"git commit failed: {err}", 1)
     print(f"OPENED {c}: reviewer={s['reviewer_model']} max={s['max_iterations']} iterations "
-          f"budget=${s['cycle_budget_usd']:.2f} base={s['base_commit'][:10]}")
+          f"budget=${s['cycle_budget_usd']:.2f} base={s['base_commit'][:10]} "
+          f"lenses={', '.join(lenses)} setup={s['setup']}")
+    for w in warns:
+        print(f"  extract warning: {w}")
+    if extract_list(ctx):
+        print(f"  text renditions: {len(extract_list(ctx))} file(s) under {ctx.rel(ctx.rdir / 'extract')}/")
     print("NEXT: review-loop review   (runs the reviewer; can take up to "
           f"{s['round_timeout_min']} min, so run it in the background)")
 
@@ -367,28 +955,51 @@ def run_reviewer(ctx: Ctx, s: dict, prompt_path: Path, out: Path, model: str, ca
     return r.returncode, cost, sid, msg
 
 
+def lens_block(ctx: Ctx, lenses: list) -> str:
+    parts = []
+    for name in lenses:
+        lens = load_lens(name, ctx.rdir)
+        body = lens[1] if lens else "(lens file not found; use the brief's intent and checklist)"
+        parts.append(f"### Lens: {name}\n\n{body}")
+    return "\n\n".join(parts)
+
+
 def build_prompt(ctx: Ctx, s: dict) -> str:
     c, n = s["cycle"], s["iteration"]
-    cats = ", ".join(f"`{x}`" for x in ctx.cfg["categories"])
-    proto = (TEMPLATES / "reviewer-protocol.md").read_text().replace("{categories}", cats)
+    cats = ", ".join(f"`{x}`" for x in cycle_categories(ctx, s))
+    proto = ((TEMPLATES / "reviewer-protocol.md").read_text()
+             .replace("{categories}", cats)
+             .replace("{lenses}", lens_block(ctx, cycle_lenses(ctx, s))))
     parts = [proto, "---\n\n# Project notes\n\n" + read(ctx.rdir / "PROJECT.md"),
              "---\n\n# Brief for this cycle\n\n" + read(ctx.cdir(c) / "BRIEF.md")]
     rd = ctx.rel(ctx.rdir)
+    excl = " ".join(shlex.quote(x) for x in ctx.diff_excludes())
     now_part = [f"---\n\n# This round\n\n- **Cycle:** `{c}`",
                 f"- **Iteration:** {n:02d} (at most {s['max_iterations']})",
                 f"- **Repository root:** `{ctx.root}` (your working directory)",
                 f"- **Commit when the cycle opened:** `{s['base_commit']}`",
                 f"- **Review records:** `{rd}/`. Earlier rounds are in "
                 f"`{rd}/cycles/{c}/iter-*/`; you may read them."]
+    if s.get("targets"):
+        now_part.append("- **Under review (paths in this repository):** "
+                        + ", ".join(f"`{t}`" for t in s["targets"]))
+    if s.get("refs"):
+        now_part.append("- **Reference material (read, don't review):** "
+                        + ", ".join(f"`{t}`" for t in s["refs"]))
+    ex = extract_list(ctx)
+    if ex:
+        now_part.append(f"- **Text renditions of binary files:** under `{rd}/extract/`, one "
+                        "`<original path>.md` per file. Read these instead of the binaries: "
+                        + ", ".join(f"`{x}`" for x in ex[:40]) + (" …" if len(ex) > 40 else ""))
     if n == 1:
         now_part.append("\nThis is the **first round**. Review the work the brief describes.")
     else:
         resp = [h for h in s["history"] if h["event"] == "response" and h["iteration"] == n - 1][-1]
         rng = f"{resp['review_commit'][:12]}..{resp['commit'][:12]}" if resp.get("commit") else None
         if rng:
-            stat = ctx.git("diff", "--stat", rng, "--", ".", f":(exclude){rd}", check=False).strip()
+            stat = ctx.git("diff", "--stat", rng, *ctx.diff_excludes(), check=False).strip()
             now_part.append(f"\n**The builder's changes since your last review:** "
-                            f"`git diff {rng} -- . ':(exclude){rd}'`\n\n```\n{stat or '(no code changes)'}\n```")
+                            f"`git diff {rng} {excl}`\n\n```\n{stat or '(no changes)'}\n```")
         fs = ledger(ctx, c, n - 1)
         verify = [f for f in fs.values() if f["status"] == "fix-pending"]
         if verify:
@@ -432,6 +1043,7 @@ def cmd_review(ctx: Ctx, a):
             "Tell the user; either close with 'Outcome: budget-reached' or, with their approval, "
             "review-loop adjust --budget N", 8)
     model = a.model or s["reviewer_model"]
+    cats = cycle_categories(ctx, s)
     it = ctx.idir(c, n)
     it.mkdir(parents=True, exist_ok=True)
     prompt_path = it / "reviewer-prompt.md"
@@ -446,7 +1058,7 @@ def cmd_review(ctx: Ctx, a):
     total_cost, attempts = cost, 1
     problems = []
     if rc == 0:
-        problems = validate_review(read(out), n, must_verify, ctx.cfg["categories"])[0]
+        problems = validate_review(read(out), n, must_verify, cats)[0]
         while problems and attempts <= ctx.cfg["format_retries"] and sid:
             fix = ("Your review failed the automatic format check:\n- " + "\n- ".join(problems)
                    + "\n\nReply with the COMPLETE corrected review (every section), in the exact format "
@@ -457,7 +1069,7 @@ def cmd_review(ctx: Ctx, a):
             attempts += 1
             if rc != 0:
                 break
-            problems = validate_review(read(out), n, must_verify, ctx.cfg["categories"])[0]
+            problems = validate_review(read(out), n, must_verify, cats)[0]
 
     s["spent_usd"] = round(s["spent_usd"] + total_cost, 6)
     touched = ctx.dirty_outside(prefix)
@@ -492,7 +1104,7 @@ def cmd_review(ctx: Ctx, a):
         sys.exit(code)
 
     text = read(out)
-    _, fs, cs, vs, rec = validate_review(text, n, must_verify, ctx.cfg["categories"])
+    _, fs, cs, vs, rec = validate_review(text, n, must_verify, cats)
     counts = {sev: sum(1 for f in fs if f[2] == sev) for sev in SEVERITIES}
     vcount = {st: sum(1 for v in vs if v[3] == st) for st in V_STATUSES}
     s["history"].append({"event": "review", "iteration": n, "at": now(), "counts": counts,
@@ -589,6 +1201,7 @@ def cmd_respond(ctx: Ctx, a):
             die("; ".join(blockers) + ". Run another round (--decision continue), or if the user "
                 "agrees, pass --override 'reason' (and say why in CLOSE.md)")
 
+    warns = refresh_extracts(ctx, s)
     head_before = ctx.head()
     ev = {"event": "response", "iteration": n, "at": now(), "verdicts": verdicts,
           "decision": a.decision, "review_commit": head_before}
@@ -601,6 +1214,9 @@ def cmd_respond(ctx: Ctx, a):
         s["iteration"], s["turn"] = n + 1, "reviewer"
         ctx.idir(c, n + 1).mkdir(exist_ok=True)
     ctx.save(c, s)
+    close_before = read(cp) if a.decision == "close" else None
+    if a.decision == "close":
+        write_round_summary(cp, s)
     summary = ", ".join(f"{v} {k.lower()}" for k, v in verdicts.items() if v) or "no verdicts"
     label = f"iter {n:02d} response — {summary}" + (f"; close: {outcome}" if outcome else "")
     err = ctx.commit([], f"review({c}): {label}")
@@ -608,10 +1224,13 @@ def cmd_respond(ctx: Ctx, a):
         s["history"].pop()
         if a.decision == "close":
             s["status"], s["turn"] = "active", ("builder" if verdicts or need else "reviewer")
+            cp.write_text(close_before)
         else:
             s["iteration"], s["turn"] = n, "builder"
         ctx.save(c, s)
         die(f"git commit failed, so nothing was handed over: {err}", 1)
+    for w in warns:
+        print(f"  extract warning: {w}")
     if a.decision == "continue":
         # the next round's diff range; saved now, committed with the next hand-over
         ev["commit"] = ctx.head()
@@ -624,7 +1243,12 @@ def cmd_respond(ctx: Ctx, a):
         print(f"CLOSED {c}: {outcome} after {n} iteration(s); {len(fs)} finding(s) "
               f"({', '.join(f'{v} {k}' for k, v in by.items()) or 'none'}); "
               f"reviewer spend {usd(s['spent_usd'])}")
-        print(f"NEXT: report to the user from {ctx.rel(cp)}: outcome, what changed, open disputes, backlog")
+        print(round_summary(s))
+        nxt = f"NEXT: report to the user from {ctx.rel(cp)}: outcome, round summary, what changed, open disputes, backlog"
+        if s.get("setup") == "workspace":
+            nxt += ("; then offer to copy the changes back (review-loop apply shows the plan; "
+                    "apply --yes only with the user's approval)")
+        print(nxt)
     else:
         print(f"HANDED OVER {c} iteration {n:02d} ({summary}). Reviewer's turn: iteration {n + 1:02d}.")
         print("NEXT: review-loop review")
@@ -635,6 +1259,7 @@ def cmd_status(ctx: Ctx, a):
     s = ctx.load(c)
     print(f"{c}: {s['status']} · turn={s['turn']} · iteration {s['iteration']}/{s['max_iterations']} · "
           f"reviewer={s['reviewer_model']} · spent {usd(s['spent_usd'])} of ${s['cycle_budget_usd']:.2f}")
+    print(f"  lenses: {', '.join(cycle_lenses(ctx, s))} · setup: {s.get('setup', 'in-place')}")
     for h in s["history"][-6:]:
         extra = {k: v for k, v in h.items() if k not in ("event", "at", "session", "review_commit", "commit")}
         print(f"  {h['at'][:16]} {h['event']:<14} {json.dumps(extra)[:150]}")
@@ -644,6 +1269,9 @@ def cmd_status(ctx: Ctx, a):
         for f in fs.values():
             by[f["status"]] = by.get(f["status"], 0) + 1
         print("  findings: " + ", ".join(f"{v} {k}" for k, v in by.items()))
+    print()
+    print(round_summary(s))
+    print()
     if s["status"] != "active":
         print(f"NEXT: closed. See {ctx.rel(ctx.cdir(c) / 'CLOSE.md')}")
     elif s["turn"] == "reviewer":
@@ -673,10 +1301,9 @@ def cmd_changes(ctx: Ctx, a):
         return
     h = resps[-1]
     rng = f"{h['review_commit'][:12]}..{h['commit'][:12]}"
-    rd = ctx.rel(ctx.rdir)
     print(f"builder changes in iteration {h['iteration']:02d}: {rng}")
-    print(ctx.git("diff", "--stat", rng, "--", ".", f":(exclude){rd}", check=False))
-    print(f"full diff: git diff {rng} -- . ':(exclude){rd}'")
+    print(ctx.git("diff", "--stat", rng, *ctx.diff_excludes(), check=False))
+    print(f"full diff: git diff {rng} " + " ".join(shlex.quote(x) for x in ctx.diff_excludes()))
 
 
 def cmd_list(ctx: Ctx, a):
@@ -692,6 +1319,20 @@ def cmd_list(ctx: Ctx, a):
                   f"iter {s['iteration']}/{s['max_iterations']}  {usd(s['spent_usd'])}")
         else:
             print(f"  {d.name:<40} (brief only)")
+
+
+def cmd_lenses(a):
+    rdir = None
+    if a.repo or run_git(Path.cwd(), "rev-parse", "--show-toplevel").returncode == 0:
+        try:
+            rdir = Ctx(a).rdir
+        except SystemExit:
+            rdir = None
+    for name in available_lenses(rdir):
+        cats, body = load_lens(name, rdir)
+        first = body.splitlines()[0].lstrip("- ").strip() if body else ""
+        print(f"{name:<13} categories: {', '.join(cats) or '(core only)'}")
+        print(f"{'':<13} {first[:100]}")
 
 
 def cmd_adjust(ctx: Ctx, a):
@@ -717,6 +1358,79 @@ def cmd_adjust(ctx: Ctx, a):
     print(f"ADJUSTED {c}: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
 
 
+def cmd_apply(ctx: Ctx, a):
+    sp = ctx.root / "SOURCES.json"
+    if not sp.exists():
+        die("apply works in workspace cycles only (no SOURCES.json here); in-place cycles already "
+            "edit the originals")
+    src = json.loads(sp.read_text())
+    snap = src["files"]
+    plan, conflicts, skipped = [], [], []
+    for inp in (i for i in src["inputs"] if i["role"] == "target"):
+        name, orig, kind = inp["in_tree"], Path(inp["original"]), inp["kind"]
+        now_files = {}
+        base = ctx.root / name
+        if kind == "file":
+            if base.exists():
+                now_files[name] = base
+        elif base.exists():
+            for dp, dns, fns in os.walk(base):
+                dns[:] = [d for d in dns if d not in COPY_SKIP]
+                for fn in fns:
+                    if fn in COPY_SKIP:
+                        continue
+                    p = Path(dp) / fn
+                    now_files[f"{name}/{p.relative_to(base).as_posix()}"] = p
+        mine = {k: v for k, v in snap.items() if k == name or k.startswith(name + "/")}
+        for rel, p in sorted(now_files.items()):
+            if rel in mine:
+                ent = mine[rel]
+                if sha256(p) == ent["sha256"]:
+                    continue
+                o = Path(ent["original"])
+                if not o.exists() or sha256(o) != ent["sha256"]:
+                    conflicts.append(f"modified: {rel} -> {o} (the original changed or is gone since the copy)")
+                else:
+                    plan.append(("modify", p, o))
+            else:                       # only possible under a directory input
+                dest = orig / Path(rel).relative_to(name)
+                if dest.exists():
+                    conflicts.append(f"new: {rel} -> {dest} (the destination already exists)")
+                elif not a.include_new:
+                    skipped.append(f"new file {rel} -> {dest} (pass --include-new)")
+                else:
+                    plan.append(("create", p, dest))
+        for rel, ent in sorted(mine.items()):
+            if rel in now_files:
+                continue
+            o = Path(ent["original"])
+            if not o.exists() or sha256(o) != ent["sha256"]:
+                conflicts.append(f"deleted: {rel} -> {o} (the original changed or is gone since the copy)")
+            elif not a.include_deletes:
+                skipped.append(f"deleted {rel} -> would delete {o} (pass --include-deletes)")
+            else:
+                plan.append(("delete", None, o))
+    for kind, p, dest in plan:
+        print(f"{'APPLY' if a.yes else 'WOULD'} {kind:<6} {dest}")
+        if a.yes:
+            if kind == "delete":
+                dest.unlink()
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dest)
+    for x in skipped:
+        print(f"SKIP   {x}")
+    for x in conflicts:
+        print(f"CONFLICT {x}")
+    if not plan and not conflicts:
+        print("nothing to apply: the workspace matches the originals")
+    if plan and not a.yes:
+        print("NEXT: this was a dry run. Show the user; with their approval run review-loop apply --yes")
+    if conflicts:
+        print(f"{len(conflicts)} conflict(s) were not applied; resolve them by hand")
+        sys.exit(3)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="review-loop", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -724,14 +1438,20 @@ def main():
     ap.add_argument("--review-dir")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, cycle=True):
+    def add(name, fn, cycle=True, noctx=False):
         p = sub.add_parser(name)
         if cycle:
             p.add_argument("--cycle")
-        p.set_defaults(fn=fn)
+        p.set_defaults(fn=fn, noctx=noctx)
         return p
 
-    p = add("new", cmd_new, cycle=False); p.add_argument("cycle")
+    p = add("new", cmd_new, cycle=False, noctx=True); p.add_argument("cycle")
+    p.add_argument("--target", action="append", help="the work under review (file or dir; repeatable)")
+    p.add_argument("--ref", action="append", help="reference material, read but not reviewed (repeatable)")
+    p.add_argument("--lenses", help="comma-separated review lenses, primary first (see `lenses`)")
+    p.add_argument("--setup", choices=("auto",) + SETUPS, default="auto")
+    p.add_argument("--workspace-root")
+    p.add_argument("--force", action="store_true", help="workspace: allow inputs over workspace_max_mb")
     p = add("init", cmd_init, cycle=False); p.add_argument("cycle")
     p.add_argument("--reviewer"); p.add_argument("--max", type=int)
     p.add_argument("--budget", type=float); p.add_argument("--trailer")
@@ -744,13 +1464,21 @@ def main():
     add("ledger", cmd_ledger)
     p = add("changes", cmd_changes); p.add_argument("--iteration", type=int)
     add("list", cmd_list, cycle=False)
+    add("lenses", cmd_lenses, cycle=False, noctx=True)
     p = add("adjust", cmd_adjust)
     p.add_argument("--budget", type=float); p.add_argument("--max", type=int)
     p.add_argument("--model"); p.add_argument("--round-budget", type=float)
     p.add_argument("--timeout", type=float)
+    p = add("apply", cmd_apply, cycle=False)
+    p.add_argument("--yes", action="store_true", help="perform the copy (default: dry run)")
+    p.add_argument("--include-new", action="store_true")
+    p.add_argument("--include-deletes", action="store_true")
     a = ap.parse_args()
     try:
-        a.fn(Ctx(a), a)
+        if a.noctx:
+            a.fn(a)
+        else:
+            a.fn(Ctx(a), a)
     except KeyboardInterrupt:
         die("interrupted", 130)
 

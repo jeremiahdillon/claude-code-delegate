@@ -35,5 +35,5 @@ Next:
   1. Read the Security section of README.md.
   2. Add the OpenCode zero-data-retention setting (README, Install step 2).
   3. Append CLAUDE.md.snippet to ~/.claude/CLAUDE.md.
-  4. Run: $HERE/review-loop/tests/selftest.sh
+  4. Run: $HERE/review-loop/tests/selftest.sh and $HERE/delegate/tests/extract_selftest.sh
 EOF
